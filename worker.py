@@ -7,7 +7,6 @@ import os
 import re
 import json
 import logging
-import threading
 import time
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
@@ -440,90 +439,88 @@ MAX_ERRORS         = 3
 MAX_TOTAL_REQUESTS = 150000
 
 
-# ===== ЧИСТЫЙ PYTHON БАТЧ — новый прокси на каждый запрос =====
+# ===== ЧИСТЫЙ PYTHON БАТЧ =====
 
 import concurrent.futures as _futures
 
-def _one_api_request(cookie: str) -> dict:
-    """Один запрос к API: новый прокси, 2 шага (CSRF + рабочий)."""
-    url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
-    body = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
+_URL  = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+_BODY = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
+_HDRS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Content-Type": "application/json;charset=utf-8",
+    "Origin": "https://www.roblox.com",
+    "Referer": "https://www.roblox.com/my/account#!/info",
+}
+
+def _get_csrf(cookie: str):
     try:
         s = _requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-            "Content-Type": "application/json;charset=utf-8",
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account#!/info",
-        })
-
-        # Шаг 1: получаем CSRF
-        r1 = s.post(url, json=body, timeout=10)
-        if r1.status_code == 200:
-            link = extract_link_from_api(r1.json()) or extract_link_from_raw(r1.text)
+        s.headers.update(_HDRS)
+        r = s.post(_URL, json=_BODY, timeout=8)
+        logging.info("CSRF fetch: status=%d", r.status_code)
+        if r.status_code == 200:
+            link = extract_link_from_api(r.json()) or extract_link_from_raw(r.text)
             if link:
-                return {"status": 200, "link": link}
-
-        csrf = r1.headers.get("x-csrf-token")
-        if not csrf:
-            return {"status": r1.status_code, "link": None, "body": r1.text[:100]}
-
-        # Шаг 2: рабочий запрос с CSRF
-        s.headers["x-csrf-token"] = csrf
-        r2 = s.post(url, json=body, timeout=10)
-        link = None
-        if r2.status_code == 200:
-            link = extract_link_from_api(r2.json()) or extract_link_from_raw(r2.text)
-        return {"status": r2.status_code, "link": link, "body": r2.text[:200],
-                "challengeType": r2.headers.get("rblx-challenge-type", "")}
+                return "__LINK__:" + link
+        return r.headers.get("x-csrf-token")
     except Exception as e:
-        return {"status": 0, "link": None, "body": str(e)}
+        logging.error("CSRF error: %s", e)
+        return None
+
+def _one_request(cookie: str, csrf: str) -> dict:
+    try:
+        s = _requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.headers.update({**_HDRS, "x-csrf-token": csrf})
+        r = s.post(_URL, json=_BODY, timeout=8)
+        link = None
+        if r.status_code == 200:
+            link = extract_link_from_api(r.json()) or extract_link_from_raw(r.text)
+        return {"status": r.status_code, "link": link,
+                "challengeType": r.headers.get("rblx-challenge-type", ""),
+                "body": r.text[:200]}
+    except Exception as e:
+        return {"status": 0, "link": None, "body": str(e), "challengeType": ""}
 
 
 def run_parallel_api(cookie: str, workers: int = BATCH_SIZE) -> str | None:
-    """Запускает workers параллельных запросов, каждый с новым прокси. Возвращает первую найденную ссылку."""
     start = time.time()
     total = 0
-    consecutive_errors = 0
+    csrf = None
 
-    while total < MAX_TOTAL_REQUESTS and time.time() - start < DEADLINE:
-        with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_one_api_request, cookie) for _ in range(workers)]
+    with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        while total < MAX_TOTAL_REQUESTS and time.time() - start < DEADLINE:
+
+            if not csrf:
+                result = _get_csrf(cookie)
+                if not result:
+                    time.sleep(0.5)
+                    continue
+                if result.startswith("__LINK__:"):
+                    return result[9:]
+                csrf = result
+
+            futs = [ex.submit(_one_request, cookie, csrf) for _ in range(workers)]
             results = [f.result() for f in _futures.as_completed(futs)]
+            total += len(results)
 
-        total += len(results)
-        statuses = [r["status"] for r in results]
-        elapsed = time.time() - start
-        rps = total / elapsed if elapsed > 0 else 0
-        logging.info("parallel batch | total=%d | %.1f req/sec | statuses=%s", total, rps, statuses)
+            elapsed = time.time() - start
+            logging.info("batch | total=%d | %.1f req/sec | statuses=%s",
+                         total, total / elapsed if elapsed else 0,
+                         [r["status"] for r in results])
 
-        all_zero = all(r["status"] == 0 for r in results)
-        got_429  = any(r["status"] == 429 for r in results)
-        got_2fa  = any("twostepverification" in r.get("challengeType", "").lower() for r in results)
+            for r in results:
+                if r.get("link"):
+                    logging.info("LINK FOUND: %s", r["link"])
+                    return r["link"]
 
-        for r in results:
-            if r.get("link"):
-                logging.info("LINK FOUND (parallel): %s", r["link"])
-                return r["link"]
-            if r["status"] == 200:
-                logging.warning("200 без ссылки: %s", r.get("body", "")[:200])
+            if any(r["status"] == 403 for r in results):
+                logging.info("CSRF протух — обновляю")
+                csrf = None
 
-        if all_zero:
-            consecutive_errors += 1
-            logging.warning("Все запросы упали (сеть). Подряд: %d", consecutive_errors)
-            if consecutive_errors >= 3:
-                logging.error("3 подряд сетевых ошибки — стоп")
-                break
-            time.sleep(1)
-        elif got_429:
-            logging.warning("429 rate limit — пауза 1 сек")
-            time.sleep(PAUSE_429)
-        elif got_2fa:
-            logging.info("2FA требуется — переходим на Playwright воркер")
-            return None  # сигнал что нужен 2FA воркер
-        else:
-            consecutive_errors = 0
+            if any("twostepverification" in r.get("challengeType", "").lower() for r in results):
+                return None
 
     return None
 
