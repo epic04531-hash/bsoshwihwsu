@@ -513,14 +513,107 @@ async (count) => {
 }
 """
 
-BATCH_SIZE         = 15    # 15 параллельных запросов за итерацию ≈ 500 req/min
-PAUSE_NORMAL       = 0.0   # без паузы — максимальная скорость
+BATCH_SIZE         = 15
+PAUSE_NORMAL       = 0.0
 PAUSE_2FA_WAIT     = 3.0
-PAUSE_429          = 1.0   # при 429 — быстрая смена прокси
-DEADLINE           = 86400  # 24 часа — лимит по кол-ву запросов, не по времени
-MAX_ERRORS         = 3     # при 3 ошибках подряд — перезагрузка
-ROTATE_PROXY_EVERY = 10    # менять прокси каждые N батчей
-MAX_TOTAL_REQUESTS = 150000  # максимум 150 000 запросов на аккаунт
+PAUSE_429          = 1.0
+DEADLINE           = 86400
+MAX_ERRORS         = 3
+ROTATE_PROXY_EVERY = 999   # не ротируем через пересоздание контекста
+MAX_TOTAL_REQUESTS = 150000
+
+
+# ===== ЧИСТЫЙ PYTHON БАТЧ — новый прокси на каждый запрос =====
+
+import concurrent.futures as _futures
+
+def _one_api_request(cookie: str) -> dict:
+    """Один запрос к API: новый прокси, 2 шага (CSRF + рабочий)."""
+    url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+    body = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
+    try:
+        proxy = get_proxy_url()
+        proxy_auth = f"http://{proxy['username']}:{proxy['password']}@{proxy['server'].replace('http://', '')}"
+        proxies = {"http": proxy_auth, "https": proxy_auth}
+
+        s = _requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.proxies.update(proxies)
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+        })
+
+        # Шаг 1: получаем CSRF
+        r1 = s.post(url, json=body, timeout=10)
+        if r1.status_code == 200:
+            link = extract_link_from_api(r1.json()) or extract_link_from_raw(r1.text)
+            if link:
+                return {"status": 200, "link": link}
+
+        csrf = r1.headers.get("x-csrf-token")
+        if not csrf:
+            return {"status": r1.status_code, "link": None, "body": r1.text[:100]}
+
+        # Шаг 2: рабочий запрос с CSRF
+        s.headers["x-csrf-token"] = csrf
+        r2 = s.post(url, json=body, timeout=10)
+        link = None
+        if r2.status_code == 200:
+            link = extract_link_from_api(r2.json()) or extract_link_from_raw(r2.text)
+        return {"status": r2.status_code, "link": link, "body": r2.text[:200],
+                "challengeType": r2.headers.get("rblx-challenge-type", "")}
+    except Exception as e:
+        return {"status": 0, "link": None, "body": str(e)}
+
+
+def run_parallel_api(cookie: str, workers: int = BATCH_SIZE) -> str | None:
+    """Запускает workers параллельных запросов, каждый с новым прокси. Возвращает первую найденную ссылку."""
+    start = time.time()
+    total = 0
+    consecutive_errors = 0
+
+    while total < MAX_TOTAL_REQUESTS and time.time() - start < DEADLINE:
+        with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_one_api_request, cookie) for _ in range(workers)]
+            results = [f.result() for f in _futures.as_completed(futs)]
+
+        total += len(results)
+        statuses = [r["status"] for r in results]
+        elapsed = time.time() - start
+        rps = total / elapsed if elapsed > 0 else 0
+        logging.info("parallel batch | total=%d | %.1f req/sec | statuses=%s", total, rps, statuses)
+
+        all_zero = all(r["status"] == 0 for r in results)
+        got_429  = any(r["status"] == 429 for r in results)
+        got_2fa  = any("twostepverification" in r.get("challengeType", "").lower() for r in results)
+
+        for r in results:
+            if r.get("link"):
+                logging.info("LINK FOUND (parallel): %s", r["link"])
+                return r["link"]
+            if r["status"] == 200:
+                logging.warning("200 без ссылки: %s", r.get("body", "")[:200])
+
+        if all_zero:
+            consecutive_errors += 1
+            logging.warning("Все запросы упали (сеть). Подряд: %d", consecutive_errors)
+            if consecutive_errors >= 3:
+                logging.error("3 подряд сетевых ошибки — стоп")
+                break
+            time.sleep(1)
+        elif got_429:
+            logging.warning("429 rate limit — пауза 1 сек")
+            time.sleep(PAUSE_429)
+        elif got_2fa:
+            logging.info("2FA требуется — переходим на Playwright воркер")
+            return None  # сигнал что нужен 2FA воркер
+        else:
+            consecutive_errors = 0
+
+    return None
 
 
 def _click_continue_if_present(page):
@@ -816,19 +909,19 @@ def get_link():
 
     logging.info("New task: method=%s cookie=%.20s...", method, cookie)
 
-    # 1. Быстрый прямой API (без браузера)
-    link = run_fast_api(cookie, method)
+    # 1. Параллельный Python API — новый прокси на каждый запрос, максимальная скорость
+    link = run_parallel_api(cookie, workers=BATCH_SIZE)
     if link:
-        logging.info("Fast API succeeded!")
+        logging.info("Parallel API succeeded!")
         return jsonify({"link": link})
 
-    # 2. Без 2FA — браузер, клик Continue, один запрос
+    # 2. Без 2FA — браузер, клик Continue (на случай если нужен клик по странице)
     link = run_no2fa_worker(cookie, method)
     if link:
         logging.info("No-2FA worker succeeded!")
         return jsonify({"link": link})
 
-    # 3. Если не вышло — запускаем Playwright с батчами (для 2FA аккаунтов)
+    # 3. Playwright с батчами — для 2FA аккаунтов
     link = run_2fa_worker(cookie, method)
 
     if link:
