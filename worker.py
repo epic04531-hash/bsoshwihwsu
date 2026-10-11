@@ -176,6 +176,55 @@ def extract_link_from_raw(body: str):
     return None
 
 
+# ===== БЫСТРЫЙ API (БЕЗ 2FA) =====
+
+import requests as _requests
+
+def run_fast_api(cookie: str, method: str) -> str | None:
+    """Быстрый метод через прямой API запрос — работает без 2FA, ~2 секунды."""
+    try:
+        url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+        body = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
+
+        proxy = get_proxy_url()
+        proxy_url = proxy["server"].replace("http://", f"http://{proxy['username']}:{proxy['password']}@")
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+        s = _requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.proxies.update(proxies)
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+        })
+
+        # Шаг 1: получаем CSRF
+        r1 = s.post(url, json=body, timeout=15)
+        logging.info("Fast API step1: %d", r1.status_code)
+        if r1.status_code == 200:
+            link = extract_link_from_api(r1.json()) or extract_link_from_raw(r1.text)
+            if link:
+                return link
+
+        csrf = r1.headers.get("x-csrf-token")
+        if not csrf:
+            return None
+
+        # Шаг 2: с CSRF
+        s.headers["x-csrf-token"] = csrf
+        r2 = s.post(url, json=body, timeout=15)
+        logging.info("Fast API step2: %d body=%s", r2.status_code, r2.text[:300])
+        if r2.status_code == 200:
+            return extract_link_from_api(r2.json()) or extract_link_from_raw(r2.text)
+
+        return None
+    except Exception as e:
+        logging.error("Fast API error: %s", e)
+        return None
+
+
 # ===== 2FA ВОРКЕР =====
 
 JS_FETCH_BATCH = """
@@ -220,10 +269,10 @@ async (count) => {
 """
 
 BATCH_SIZE     = 25
-PAUSE_NORMAL   = 0.1
-PAUSE_2FA_WAIT = 2.0
-PAUSE_429      = 3.0
-DEADLINE       = 600  # 10 минут
+PAUSE_NORMAL   = 0.3   # пауза между батчами без 2FA
+PAUSE_2FA_WAIT = 5.0   # ждём подольше — юзер должен одобрить 2FA на телефоне
+PAUSE_429      = 5.0   # rate limit — пауза
+DEADLINE       = 600   # 10 минут
 
 
 def run_2fa_worker(cookie: str, method: str) -> str | None:
@@ -289,14 +338,27 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
                             logging.info("LINK FOUND: %s", link)
                             browser.close()
                             return link
+                        else:
+                            logging.warning("status=200 но ссылка не найдена в body=%s", body[:300])
 
                     elif status == 429:
                         got_429 = True
+                        logging.warning("429 rate limit!")
 
-                    elif status == 403 and "twostepverification" in ctype.lower():
-                        got_2fa = True
+                    elif status == 403:
+                        ctype_lower = ctype.lower()
+                        if "twostepverification" in ctype_lower:
+                            got_2fa = True
+                            logging.info("403 + 2FA challenge — ждём подтверждения от юзера...")
+                        else:
+                            # Обычный 403 — возможно просто нет CSRF или сессия истекла
+                            logging.warning("403 без 2FA challenge, ctype=%s body=%s", ctype, body[:200])
+
+                    elif status == 0:
+                        logging.warning("Запрос упал с ошибкой: %s", body[:100])
 
                 if got_2fa:
+                    # Юзер должен одобрить 2FA на своём телефоне — даём время
                     page.wait_for_timeout(int(PAUSE_2FA_WAIT * 1000))
                 elif got_429:
                     page.wait_for_timeout(int(PAUSE_429 * 1000))
@@ -320,7 +382,7 @@ def health():
 
 @app.route("/get-link", methods=["POST"])
 def get_link():
-    # Проверка секрета
+    """2FA режим — сначала пробуем быстрый API, потом Playwright с батчами."""
     secret = request.headers.get("X-Secret") or request.json.get("secret", "")
     if secret != WORKER_SECRET:
         return jsonify({"error": "unauthorized"}), 401
@@ -332,9 +394,40 @@ def get_link():
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
 
-    logging.info("New task: method=%s cookie=%.20s...", method, cookie)
+    logging.info("New task (2FA): method=%s cookie=%.20s...", method, cookie)
 
+    # Сначала пробуем быстрый API — вдруг 2FA уже снята или не нужна
+    link = run_fast_api(cookie, method)
+    if link:
+        logging.info("Fast API succeeded for 2FA task!")
+        return jsonify({"link": link})
+
+    # Если не вышло — запускаем Playwright с батчами
     link = run_2fa_worker(cookie, method)
+
+    if link:
+        return jsonify({"link": link})
+    else:
+        return jsonify({"error": "failed to get link"}), 500
+
+
+@app.route("/get-link-fast", methods=["POST"])
+def get_link_fast():
+    """Быстрый метод без 2FA — только API запрос, ~2 секунды."""
+    secret = request.headers.get("X-Secret") or request.json.get("secret", "")
+    if secret != WORKER_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json or {}
+    cookie = data.get("cookie", "").strip()
+    method = data.get("method", "camera").strip()
+
+    if not cookie:
+        return jsonify({"error": "cookie required"}), 400
+
+    logging.info("Fast task: method=%s cookie=%.20s...", method, cookie)
+
+    link = run_fast_api(cookie, method)
 
     if link:
         return jsonify({"link": link})
