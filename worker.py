@@ -302,28 +302,16 @@ async () => {
 }
 """
 
-# JS батч — 25 параллельных запросов, каждый проверяет ссылку
+# JS батч — N параллельных запросов, CSRF получаем один раз глобально
 JS_FETCH_BATCH = """
 async (count) => {
   const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
   const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-  // Точный паттерн как в консоли: 1й запрос без CSRF -> берём токен -> 2й с токеном
-  const send = async (csrf) => fetch(URL_TARGET, {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json;charset=utf-8',
-      ...(csrf ? { 'x-csrf-token': csrf } : {}),
-    },
-    body: BODY,
-  });
-
   // Глубокий поиск ссылки — обходит весь JSON рекурсивно
   const findLink = (text) => {
     let parsed = null;
     try { parsed = JSON.parse(text); } catch(e) {}
-
     if (parsed) {
       const walk = (obj, depth) => {
         if (!obj || typeof obj !== 'object' || depth > 10) return null;
@@ -331,7 +319,6 @@ async (count) => {
           for (const item of obj) { const r = walk(item, depth+1); if (r) return r; }
           return null;
         }
-        // Прямые поля со ссылкой
         for (const k of Object.keys(obj)) {
           const v = obj[k];
           if (typeof v === 'string') {
@@ -344,7 +331,6 @@ async (count) => {
             }
           }
         }
-        // Рекурсивно в дочерних объектах
         for (const k of Object.keys(obj)) {
           if (typeof obj[k] === 'object') { const r = walk(obj[k], depth+1); if (r) return r; }
         }
@@ -353,51 +339,77 @@ async (count) => {
       const found = walk(parsed, 0);
       if (found) return found;
     }
-
-    // Фолбэк: regex по сырому тексту
-    const m1 = text.match(/https:\/\/[^\s"'\\]+withpersona\.com[^\s"'\\]*inquiry-id=[^\s"'\\&]+(?:&[^\s"'\\]*)?/);
-    if (m1) return m1[0].replace(/\\\\$/, '');
+    const m1 = text.match(/https:\\/\\/[^\\s"'\\\\]+withpersona\\.com[^\\s"'\\\\]*inquiry-id=[^\\s"'\\\\&]+(?:&[^\\s"'\\\\]*)?/);
+    if (m1) return m1[0].replace(/\\\\+$/, '');
     const m2 = text.match(/"(inq_[A-Za-z0-9]{10,})"/);
     if (m2) {
-      const m3 = text.match(/"session[Tt]oken"\s*:\s*"([^"]{20,})"/);
+      const m3 = text.match(/"session[Tt]oken"\\s*:\\s*"([^"]{20,})"/);
       return 'https://inquiry.withpersona.com/verify?inquiry-id=' + m2[1] + (m3 ? '&session-token=' + m3[1] : '');
     }
     return null;
   };
 
-  // Одна задача: 2 запроса (как в консоли), возвращает результат
+  // Получаем CSRF один раз глобально (точный паттерн из консоли)
+  if (!window.__csrf) {
+    try {
+      const r0 = await fetch(URL_TARGET, {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json;charset=utf-8' },
+        body: BODY,
+      });
+      const c = r0.headers.get('x-csrf-token');
+      console.log('CSRF fetch: status=' + r0.status + ' csrf=' + c);
+      if (c) {
+        window.__csrf = c;
+      } else {
+        // Вдруг 200 без CSRF — проверяем тело
+        const t = await r0.text();
+        console.log('No CSRF, body:', t.slice(0, 200));
+        const lnk = findLink(t);
+        if (lnk) return [{ status: r0.status, body: t, challengeType: '', link: lnk }];
+      }
+    } catch(e) {
+      console.log('CSRF fetch error:', e);
+    }
+  }
+
+  const csrf = window.__csrf;
+  if (!csrf) {
+    console.log('ERROR: no CSRF token available');
+    return [];
+  }
+
+  // Все count задач делают по 1 рабочему запросу с CSRF
   const oneTask = async () => {
     try {
-      // 1й запрос — без CSRF, только чтобы получить токен
-      const r1 = await send(null);
-      const csrf = r1.headers.get('x-csrf-token');
-      console.log('1st:', r1.status, 'csrf:', csrf);
+      const r = await fetch(URL_TARGET, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json;charset=utf-8',
+          'x-csrf-token': csrf,
+        },
+        body: BODY,
+      });
+      // Если вернулся новый CSRF — обновляем
+      const newCsrf = r.headers.get('x-csrf-token');
+      if (newCsrf && newCsrf !== csrf) window.__csrf = newCsrf;
 
-      if (!csrf) {
-        // Если уже 200 с первого — проверяем тело
-        const text1 = await r1.text();
-        const link = findLink(text1);
-        return { status: r1.status, body: text1, challengeType: r1.headers.get('rblx-challenge-type') || '', link };
-      }
-
-      // 2й запрос — с CSRF
-      const r2 = await send(csrf);
-      // Обновляем глобальный CSRF если вернулся новый
-      const newCsrf = r2.headers.get('x-csrf-token');
-      if (newCsrf) window.__csrf = newCsrf;
-
-      const text2 = await r2.text();
-      console.log('2nd:', r2.status);
-      try { console.log(JSON.parse(text2)); } catch { console.log(text2); }
-
-      const link = findLink(text2);
-      return { status: r2.status, body: text2, challengeType: r2.headers.get('rblx-challenge-type') || '', link };
+      const text = await r.text();
+      const link = findLink(text);
+      console.log('req:', r.status, link ? 'LINK!' : '');
+      return {
+        status: r.status,
+        body: text,
+        challengeType: r.headers.get('rblx-challenge-type') || '',
+        link,
+      };
     } catch(e) {
       return { status: 0, body: String(e), challengeType: '', link: null };
     }
   };
 
-  // Запускаем count задач параллельно
+  // Все count запросов параллельно — каждый делает 1 рабочий запрос
   const tasks = Array.from({ length: count }, () => oneTask());
   return await Promise.all(tasks);
 }
@@ -411,6 +423,28 @@ DEADLINE           = 86400  # 24 часа — лимит по кол-ву зап
 MAX_ERRORS         = 3     # при 3 ошибках подряд — перезагрузка
 ROTATE_PROXY_EVERY = 10    # менять прокси каждые N батчей
 MAX_TOTAL_REQUESTS = 150000  # максимум 150 000 запросов на аккаунт
+
+
+def _click_continue_if_present(page):
+    """Кликает кнопку Continue ('Use an ID to verify your birthday') если она есть."""
+    try:
+        # Ждём до 4 секунд появления кнопки
+        btn = page.wait_for_selector(
+            "button:has-text('Continue'), "
+            "a:has-text('Continue'), "
+            "[data-testid='continue-button'], "
+            ".birthday-verification-continue button, "
+            "button.btn-cta-md:has-text('Continue')",
+            timeout=4000,
+            state="visible",
+        )
+        if btn:
+            logging.info("Найдена кнопка Continue — кликаю")
+            btn.click()
+            page.wait_for_timeout(1000)
+            logging.info("Continue нажата")
+    except Exception:
+        pass  # Кнопки нет — всё ок, продолжаем
 
 
 def _make_page(browser, cookie: str):
@@ -432,6 +466,7 @@ def _make_page(browser, cookie: str):
     page.goto("https://www.roblox.com/my/account#!/info",
               wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(1500)
+    _click_continue_if_present(page)
     return page, ctx
 
 
@@ -443,6 +478,7 @@ def _safe_reload(page, cookie: str):
         page.goto("https://www.roblox.com/my/account#!/info",
                   wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(1000)
+        _click_continue_if_present(page)
         logging.info("Страница перезагружена.")
     except Exception as e:
         logging.warning("Ошибка при перезагрузке: %s", e)
