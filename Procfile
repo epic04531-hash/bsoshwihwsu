@@ -1,1 +1,0 @@
-web: playwright install chromium && python worker.py
