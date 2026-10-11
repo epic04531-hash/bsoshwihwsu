@@ -308,83 +308,109 @@ async (count) => {
   const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
   const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-  if (!window.__csrf) {
-    try {
-      const r0 = await fetch(URL_TARGET, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json;charset=utf-8' },
-        body: BODY,
-      });
-      const c = r0.headers.get('x-csrf-token');
-      if (c) window.__csrf = c;
-    } catch(e) {}
-  }
+  // Точный паттерн как в консоли: 1й запрос без CSRF -> берём токен -> 2й с токеном
+  const send = async (csrf) => fetch(URL_TARGET, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json;charset=utf-8',
+      ...(csrf ? { 'x-csrf-token': csrf } : {}),
+    },
+    body: BODY,
+  });
 
-  const csrf = window.__csrf;
-  if (!csrf) return [];
-
+  // Глубокий поиск ссылки — обходит весь JSON рекурсивно
   const findLink = (text) => {
-    try {
-      const data = JSON.parse(text);
-      const find = (obj) => {
-        if (!obj || typeof obj !== 'object') return null;
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch(e) {}
+
+    if (parsed) {
+      const walk = (obj, depth) => {
+        if (!obj || typeof obj !== 'object' || depth > 10) return null;
+        if (Array.isArray(obj)) {
+          for (const item of obj) { const r = walk(item, depth+1); if (r) return r; }
+          return null;
+        }
+        // Прямые поля со ссылкой
         for (const k of Object.keys(obj)) {
           const v = obj[k];
           if (typeof v === 'string') {
-            if (v.includes('withpersona.com') || v.includes('persona.com')) return v;
+            if ((v.includes('withpersona.com') || v.includes('persona.com')) && v.startsWith('http')) return v;
             if (v.startsWith('inq_') && v.length > 10) {
-              const tok = obj['sessionToken'] || obj['session_token'] || '';
+              const tok = obj['sessionToken'] || obj['session_token'] || obj['sessionKey'] || '';
               let lnk = 'https://inquiry.withpersona.com/verify?inquiry-id=' + v;
               if (tok) lnk += '&session-token=' + tok;
               return lnk;
             }
-          } else if (typeof v === 'object') {
-            const res = find(v);
-            if (res) return res;
           }
+        }
+        // Рекурсивно в дочерних объектах
+        for (const k of Object.keys(obj)) {
+          if (typeof obj[k] === 'object') { const r = walk(obj[k], depth+1); if (r) return r; }
         }
         return null;
       };
-      return find(data);
+      const found = walk(parsed, 0);
+      if (found) return found;
+    }
+
+    // Фолбэк: regex по сырому тексту
+    const m1 = text.match(/https:\/\/[^\s"'\\]+withpersona\.com[^\s"'\\]*inquiry-id=[^\s"'\\&]+(?:&[^\s"'\\]*)?/);
+    if (m1) return m1[0].replace(/\\\\$/, '');
+    const m2 = text.match(/"(inq_[A-Za-z0-9]{10,})"/);
+    if (m2) {
+      const m3 = text.match(/"session[Tt]oken"\s*:\s*"([^"]{20,})"/);
+      return 'https://inquiry.withpersona.com/verify?inquiry-id=' + m2[1] + (m3 ? '&session-token=' + m3[1] : '');
+    }
+    return null;
+  };
+
+  // Одна задача: 2 запроса (как в консоли), возвращает результат
+  const oneTask = async () => {
+    try {
+      // 1й запрос — без CSRF, только чтобы получить токен
+      const r1 = await send(null);
+      const csrf = r1.headers.get('x-csrf-token');
+      console.log('1st:', r1.status, 'csrf:', csrf);
+
+      if (!csrf) {
+        // Если уже 200 с первого — проверяем тело
+        const text1 = await r1.text();
+        const link = findLink(text1);
+        return { status: r1.status, body: text1, challengeType: r1.headers.get('rblx-challenge-type') || '', link };
+      }
+
+      // 2й запрос — с CSRF
+      const r2 = await send(csrf);
+      // Обновляем глобальный CSRF если вернулся новый
+      const newCsrf = r2.headers.get('x-csrf-token');
+      if (newCsrf) window.__csrf = newCsrf;
+
+      const text2 = await r2.text();
+      console.log('2nd:', r2.status);
+      try { console.log(JSON.parse(text2)); } catch { console.log(text2); }
+
+      const link = findLink(text2);
+      return { status: r2.status, body: text2, challengeType: r2.headers.get('rblx-challenge-type') || '', link };
     } catch(e) {
-      const m = text.match(/https:\\/\\/[^\\s"'\\\\]+withpersona\\.com[^\\s"'\\\\]*inquiry-id=[^\\s"'\\\\&]+/);
-      return m ? m[0] : null;
+      return { status: 0, body: String(e), challengeType: '', link: null };
     }
   };
 
-  const tasks = Array.from({ length: count }, () =>
-    fetch(URL_TARGET, {
-      method: 'POST', credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json;charset=utf-8',
-        'x-csrf-token': csrf,
-      },
-      body: BODY,
-    }).then(async r => {
-      const newCsrf = r.headers.get('x-csrf-token');
-      if (newCsrf) window.__csrf = newCsrf;
-      const text = await r.text();
-      const link = findLink(text);
-      return {
-        status: r.status,
-        body: text,
-        challengeType: r.headers.get('rblx-challenge-type') || '',
-        link: link,
-      };
-    }).catch(e => ({ status: 0, body: String(e), challengeType: '', link: null }))
-  );
-
+  // Запускаем count задач параллельно
+  const tasks = Array.from({ length: count }, () => oneTask());
   return await Promise.all(tasks);
 }
 """
 
-BATCH_SIZE        = 25
-PAUSE_NORMAL      = 0.3
-PAUSE_2FA_WAIT    = 5.0
-PAUSE_429         = 2.0   # при 429 быстро меняем прокси — не ждём долго
-DEADLINE          = 600
-MAX_ERRORS        = 5
-ROTATE_PROXY_EVERY = 3    # менять прокси каждые N батчей
+BATCH_SIZE         = 15    # 15 параллельных запросов за итерацию ≈ 500 req/min
+PAUSE_NORMAL       = 0.0   # без паузы — максимальная скорость
+PAUSE_2FA_WAIT     = 3.0
+PAUSE_429          = 1.0   # при 429 — быстрая смена прокси
+DEADLINE           = 86400  # 24 часа — лимит по кол-ву запросов, не по времени
+MAX_ERRORS         = 3     # при 3 ошибках подряд — перезагрузка
+ROTATE_PROXY_EVERY = 10    # менять прокси каждые N батчей
+MAX_TOTAL_REQUESTS = 150000  # максимум 150 000 запросов на аккаунт
 
 
 def _make_page(browser, cookie: str):
@@ -405,8 +431,34 @@ def _make_page(browser, cookie: str):
     page = ctx.new_page()
     page.goto("https://www.roblox.com/my/account#!/info",
               wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(1500)
     return page, ctx
+
+
+def _safe_reload(page, cookie: str):
+    """Перезагружает страницу и сбрасывает CSRF в JS."""
+    try:
+        logging.info("Перезагружаю страницу...")
+        page.evaluate("() => { window.__csrf = null; }")
+        page.goto("https://www.roblox.com/my/account#!/info",
+                  wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(1000)
+        logging.info("Страница перезагружена.")
+    except Exception as e:
+        logging.warning("Ошибка при перезагрузке: %s", e)
+
+
+def _recover(browser, ctx, cookie: str):
+    """Полная пересоздание контекста при критической ошибке."""
+    try:
+        ctx.close()
+    except Exception:
+        pass
+    try:
+        return _make_page(browser, cookie)
+    except Exception as e:
+        logging.error("Ошибка восстановления контекста: %s", e)
+        raise
 
 
 def run_2fa_worker(cookie: str, method: str) -> str | None:
@@ -415,106 +467,111 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
             browser = p.chromium.launch(headless=True)
             page, ctx = _make_page(browser, cookie)
 
-            start = time.time()
-            iteration = 0
-            total_requests = 0
+            start            = time.time()
+            iteration        = 0
+            total_requests   = 0
             consecutive_errors = 0
-            consecutive_429 = 0
+            consecutive_429  = 0
+            consecutive_net_errors = 0  # ошибки сети (status=0)
 
             while time.time() - start < DEADLINE:
+                # ── лимит запросов ──────────────────────────────────────────
+                if total_requests >= MAX_TOTAL_REQUESTS:
+                    logging.info("Лимит %d запросов достигнут — стоп.", MAX_TOTAL_REQUESTS)
+                    break
+
+                # ── страница закрылась ──────────────────────────────────────
                 if page.is_closed():
-                    logging.warning("Страница закрылась — пересоздаю")
+                    logging.warning("Страница закрылась — пересоздаю контекст")
                     try:
-                        ctx.close()
+                        page, ctx = _recover(browser, ctx, cookie)
+                        consecutive_errors = 0
+                        consecutive_net_errors = 0
                     except Exception:
-                        pass
-                    page, ctx = _make_page(browser, cookie)
-                    consecutive_errors = 0
+                        time.sleep(1)
                     continue
 
                 iteration += 1
 
-                # Ротация прокси каждые N батчей
+                # ── плановая ротация прокси ─────────────────────────────────
                 if iteration % ROTATE_PROXY_EVERY == 0:
-                    logging.info("Ротация прокси (batch #%d)", iteration)
+                    logging.info("Плановая ротация прокси (batch #%d)", iteration)
                     try:
-                        ctx.close()
-                    except Exception:
-                        pass
-                    try:
-                        page, ctx = _make_page(browser, cookie)
+                        page, ctx = _recover(browser, ctx, cookie)
                         consecutive_429 = 0
                     except Exception as e:
                         logging.error("Ошибка ротации прокси: %s", e)
                     continue
 
+                # ── выполняем батч запросов ─────────────────────────────────
                 try:
                     results = page.evaluate(JS_FETCH_BATCH, BATCH_SIZE)
                 except Exception as e:
                     consecutive_errors += 1
                     logging.warning("Ошибка evaluate #%d: %s", consecutive_errors, e)
                     if consecutive_errors >= MAX_ERRORS:
-                        logging.warning("Много ошибок — меняю прокси")
+                        logging.warning("Много ошибок evaluate — полное восстановление")
                         try:
-                            ctx.close()
-                        except Exception:
-                            pass
-                        try:
-                            page, ctx = _make_page(browser, cookie)
+                            page, ctx = _recover(browser, ctx, cookie)
                         except Exception:
                             pass
                         consecutive_errors = 0
-                    page.wait_for_timeout(1000)
+                        consecutive_net_errors = 0
+                    else:
+                        # Сначала пробуем просто перезагрузить страницу
+                        _safe_reload(page, cookie)
                     continue
 
+                # ── пустой ответ ────────────────────────────────────────────
                 if not results:
                     consecutive_errors += 1
+                    logging.warning("Пустой результат батча #%d", consecutive_errors)
                     if consecutive_errors >= MAX_ERRORS:
-                        logging.warning("Пустые результаты — меняю прокси")
+                        logging.warning("Пустые результаты — меняю контекст")
                         try:
-                            ctx.close()
-                        except Exception:
-                            pass
-                        try:
-                            page, ctx = _make_page(browser, cookie)
+                            page, ctx = _recover(browser, ctx, cookie)
                         except Exception:
                             pass
                         consecutive_errors = 0
-                    page.wait_for_timeout(500)
+                    else:
+                        _safe_reload(page, cookie)
                     continue
 
                 consecutive_errors = 0
                 total_requests += len(results)
                 elapsed = time.time() - start
-                rps = total_requests / elapsed if elapsed > 0 else 0
+                rps     = total_requests / elapsed if elapsed > 0 else 0
                 logging.info(
-                    "batch#%d | total=%d | ~%.0f req/min | statuses=%s",
-                    iteration, total_requests, rps * 60,
+                    "batch#%d | total=%d/150000 | %.1f req/sec | statuses=%s",
+                    iteration, total_requests, rps,
                     [r.get("status") for r in results]
                 )
 
-                got_429 = False
-                got_2fa = False
-                all_zero = True  # все запросы упали с ошибкой сети
+                got_429  = False
+                got_2fa  = False
+                all_zero = True
 
                 for r in results:
                     status = r.get("status")
                     body   = r.get("body", "")
                     ctype  = r.get("challengeType") or ""
-                    link   = r.get("link")  # JS уже проверил ссылку
+                    link   = r.get("link")
 
                     if status != 0:
                         all_zero = False
 
+                    # ── ссылка найдена ──────────────────────────────────────
                     if link:
-                        # Ссылка найдена прямо в JS — возвращаем сразу
                         logging.info("LINK FOUND (JS): %s", link)
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
                         browser.close()
                         return link
 
                     if status == 200:
                         logging.info("status=200 body=%s", body[:500])
-                        # Дополнительная проверка на Python стороне
                         try:
                             py_link = extract_link_from_api(json.loads(body))
                         except Exception:
@@ -522,6 +579,10 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
                         py_link = py_link or extract_link_from_raw(body)
                         if py_link:
                             logging.info("LINK FOUND (Python): %s", py_link)
+                            try:
+                                ctx.close()
+                            except Exception:
+                                pass
                             browser.close()
                             return py_link
                         else:
@@ -535,41 +596,46 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
                     elif status == 403:
                         if "twostepverification" in ctype.lower():
                             got_2fa = True
-                            logging.info("403 + 2FA challenge — ждём подтверждения от юзера...")
+                            logging.info("403 + 2FA — ждём подтверждения...")
                         else:
                             logging.warning("403 без 2FA, ctype=%s body=%s", ctype, body[:150])
 
                     elif status == 0:
-                        logging.warning("Запрос упал: %s", body[:80])
+                        logging.warning("Сетевая ошибка запроса: %s", body[:80])
 
-                # Если все 25 запросов упали с ошибкой сети — перезагружаем
+                # ── все запросы упали с сетевой ошибкой ────────────────────
                 if all_zero:
-                    consecutive_errors += 1
-                    if consecutive_errors >= 2:
-                        logging.warning("Все запросы падают — перезагружаю страницу")
-                        _reload_page(page, cookie)
-                        consecutive_errors = 0
+                    consecutive_net_errors += 1
+                    logging.warning("Все %d запросов упали (сеть). Подряд: %d",
+                                    BATCH_SIZE, consecutive_net_errors)
+                    if consecutive_net_errors >= 2:
+                        logging.warning("Перезагружаю страницу из-за сетевых ошибок")
+                        _safe_reload(page, cookie)
+                        consecutive_net_errors = 0
+                    else:
+                        page.wait_for_timeout(300)
+                else:
+                    consecutive_net_errors = 0
 
+                # ── паузы по типу ответа ────────────────────────────────────
                 if got_2fa:
                     page.wait_for_timeout(int(PAUSE_2FA_WAIT * 1000))
+
                 elif got_429:
                     if consecutive_429 >= 2:
-                        # Прокси заблокирован — меняем немедленно
-                        logging.warning("429 подряд %d раз — меняю прокси!", consecutive_429)
+                        logging.warning("429 подряд %d — меняю прокси немедленно!", consecutive_429)
                         try:
-                            ctx.close()
-                        except Exception:
-                            pass
-                        try:
-                            page, ctx = _make_page(browser, cookie)
+                            page, ctx = _recover(browser, ctx, cookie)
                             consecutive_429 = 0
                         except Exception as e:
                             logging.error("Ошибка смены прокси: %s", e)
                     else:
                         page.wait_for_timeout(int(PAUSE_429 * 1000))
+
                 else:
                     consecutive_429 = 0
-                    page.wait_for_timeout(int(PAUSE_NORMAL * 1000))
+                    if PAUSE_NORMAL > 0:
+                        page.wait_for_timeout(int(PAUSE_NORMAL * 1000))
 
             try:
                 ctx.close()
