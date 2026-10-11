@@ -18,84 +18,6 @@ app = Flask(__name__)
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "mysecret")  # защита от чужих запросов
 
-# ===== ПРОКСИ =====
-_PROXY_LIST = [
-    "dc.decodo.com:10001:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10002:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10003:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10004:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10005:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10006:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10007:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10008:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10009:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10010:spv4yuud2r:5vdwAL4mymi+f83XtV",
-    "dc.decodo.com:10001:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10002:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10003:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10004:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10005:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10006:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10007:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10008:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10009:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10010:sp3g12m118:~A1rRln78IYeemro5q",
-    "dc.decodo.com:10001:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10002:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10003:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10004:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10005:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10006:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10007:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10008:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10009:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10010:spxl7cd51h:=j70U8vw9ySLeizfkW",
-    "dc.decodo.com:10001:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10002:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10003:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10004:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10005:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10006:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10007:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10008:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10009:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10010:sp5xvqyhjn:d0u5Gfkqr=qK93HtUu",
-    "dc.decodo.com:10001:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10002:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10003:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10004:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10005:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10006:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10007:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10008:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10009:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10010:sphz054mdr:a0efg1NruE=d9NsM5k",
-    "dc.decodo.com:10001:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10002:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10003:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10004:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10005:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10006:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10007:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10008:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10009:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-    "dc.decodo.com:10010:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
-]
-_proxy_index = 0
-_proxy_lock = threading.Lock()
-
-def get_proxy_url():
-    global _proxy_index
-    with _proxy_lock:
-        entry = _PROXY_LIST[_proxy_index % len(_PROXY_LIST)]
-        _proxy_index += 1
-    host, port, user, passwd = entry.split(":")
-    return {
-        "server": f"http://{host}:{port}",
-        "username": user,
-        "password": passwd,
-    }
-
 
 # ===== ИЗВЛЕЧЕНИЕ ССЫЛКИ =====
 
@@ -186,13 +108,8 @@ def run_fast_api(cookie: str, method: str) -> str | None:
         url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
         body = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
 
-        proxy = get_proxy_url()
-        proxy_url = proxy["server"].replace("http://", f"http://{proxy['username']}:{proxy['password']}@")
-        proxies = {"http": proxy_url, "https": proxy_url}
-
         s = _requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
-        s.proxies.update(proxies)
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
             "Content-Type": "application/json;charset=utf-8",
@@ -519,7 +436,7 @@ PAUSE_2FA_WAIT     = 3.0
 PAUSE_429          = 1.0
 DEADLINE           = 86400
 MAX_ERRORS         = 3
-ROTATE_PROXY_EVERY = 999   # не ротируем через пересоздание контекста
+
 MAX_TOTAL_REQUESTS = 150000
 
 
@@ -532,13 +449,8 @@ def _one_api_request(cookie: str) -> dict:
     url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
     body = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
     try:
-        proxy = get_proxy_url()
-        proxy_auth = f"http://{proxy['username']}:{proxy['password']}@{proxy['server'].replace('http://', '')}"
-        proxies = {"http": proxy_auth, "https": proxy_auth}
-
         s = _requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
-        s.proxies.update(proxies)
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
             "Content-Type": "application/json;charset=utf-8",
@@ -640,12 +552,9 @@ def _click_continue_if_present(page):
 
 def _make_page(browser, cookie: str):
     """Создаёт новый контекст с новым прокси и возвращает страницу."""
-    proxy = get_proxy_url()
-    logging.info("Новый прокси: %s", proxy["server"])
     ctx = browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
         viewport={"width": 1280, "height": 800},
-        proxy=proxy,
     )
     ctx.add_cookies([{
         "name": ".ROBLOSECURITY",
