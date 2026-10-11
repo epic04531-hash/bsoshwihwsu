@@ -225,6 +225,104 @@ def run_fast_api(cookie: str, method: str) -> str | None:
         return None
 
 
+# ===== БЕЗ 2FA ВОРКЕР =====
+
+def run_no2fa_worker(cookie: str, method: str) -> str | None:
+    """Для аккаунтов без 2FA: заходим на страницу, кликаем Continue, делаем API запрос."""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--single-process",
+                    "--no-zygote",
+                ]
+            )
+            page, ctx = _make_page(browser, cookie)
+            # _make_page уже кликает Continue если есть
+
+            # Делаем один батч запросов через JS (CSRF получается автоматически)
+            JS_SINGLE = """
+async () => {
+  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+
+  const send = (csrf) => fetch(URL_TARGET, {
+    method: 'POST', credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json;charset=utf-8',
+      ...(csrf ? { 'x-csrf-token': csrf } : {}),
+    },
+    body: BODY,
+  });
+
+  const findLink = (text) => {
+    try {
+      const data = JSON.parse(text);
+      const walk = (obj, d) => {
+        if (!obj || typeof obj !== 'object' || d > 10) return null;
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          if (typeof v === 'string') {
+            if ((v.includes('withpersona.com') || v.includes('persona.com')) && v.startsWith('http')) return v;
+            if (v.startsWith('inq_') && v.length > 10) {
+              const tok = obj['sessionToken'] || obj['session_token'] || '';
+              return 'https://inquiry.withpersona.com/verify?inquiry-id=' + v + (tok ? '&session-token=' + tok : '');
+            }
+          }
+          if (typeof obj[k] === 'object') { const r = walk(obj[k], d+1); if (r) return r; }
+        }
+        return null;
+      };
+      return walk(data, 0);
+    } catch(e) {
+      const m = text.match(/https:\\/\\/[^\\s"']+withpersona\\.com[^\\s"']*inquiry-id=[^\\s"'&]+/);
+      return m ? m[0] : null;
+    }
+  };
+
+  // 1й запрос — получаем CSRF
+  let r = await send(null);
+  const csrf = r.headers.get('x-csrf-token');
+  console.log('step1:', r.status, 'csrf:', csrf);
+  if (!csrf) {
+    const t = await r.text();
+    return { status: r.status, body: t, link: findLink(t) };
+  }
+
+  // 2й запрос — с CSRF
+  r = await send(csrf);
+  const text = await r.text();
+  console.log('step2:', r.status, text.slice(0, 200));
+  return { status: r.status, body: text, link: findLink(text) };
+}
+"""
+            try:
+                result = page.evaluate(JS_SINGLE)
+                logging.info("no2fa result: status=%s link=%s body=%s",
+                             result.get("status"), result.get("link"), result.get("body", "")[:200])
+                link = result.get("link")
+                if not link and result.get("status") == 200:
+                    link = extract_link_from_api(json.loads(result["body"])) if result.get("body") else None
+                    link = link or extract_link_from_raw(result.get("body", ""))
+            except Exception as e:
+                logging.error("no2fa JS error: %s", e)
+                link = None
+            finally:
+                try: ctx.close()
+                except Exception: pass
+                browser.close()
+
+            return link
+    except Exception as e:
+        logging.error("run_no2fa_worker error: %s", e)
+        return None
+
+
 # ===== 2FA ВОРКЕР =====
 
 # JS который делает один запрос и возвращает статус + body + ссылку если нашлась
@@ -500,7 +598,17 @@ def _recover(browser, ctx, cookie: str):
 def run_2fa_worker(cookie: str, method: str) -> str | None:
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--single-process",
+                    "--no-zygote",
+                ]
+            )
             page, ctx = _make_page(browser, cookie)
 
             start            = time.time()
@@ -706,15 +814,21 @@ def get_link():
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
 
-    logging.info("New task (2FA): method=%s cookie=%.20s...", method, cookie)
+    logging.info("New task: method=%s cookie=%.20s...", method, cookie)
 
-    # Сначала пробуем быстрый API — вдруг 2FA уже снята или не нужна
+    # 1. Быстрый прямой API (без браузера)
     link = run_fast_api(cookie, method)
     if link:
-        logging.info("Fast API succeeded for 2FA task!")
+        logging.info("Fast API succeeded!")
         return jsonify({"link": link})
 
-    # Если не вышло — запускаем Playwright с батчами
+    # 2. Без 2FA — браузер, клик Continue, один запрос
+    link = run_no2fa_worker(cookie, method)
+    if link:
+        logging.info("No-2FA worker succeeded!")
+        return jsonify({"link": link})
+
+    # 3. Если не вышло — запускаем Playwright с батчами (для 2FA аккаунтов)
     link = run_2fa_worker(cookie, method)
 
     if link:
