@@ -227,23 +227,130 @@ def run_fast_api(cookie: str, method: str) -> str | None:
 
 # ===== 2FA ВОРКЕР =====
 
+# JS который делает один запрос и возвращает статус + body + ссылку если нашлась
+JS_SINGLE_REQUEST = """
+async () => {
+  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+
+  // Получаем CSRF если нет
+  if (!window.__csrf) {
+    try {
+      const r0 = await fetch(URL_TARGET, {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json;charset=utf-8' },
+        body: BODY,
+      });
+      const c = r0.headers.get('x-csrf-token');
+      if (c) window.__csrf = c;
+    } catch(e) {}
+  }
+
+  const csrf = window.__csrf;
+  if (!csrf) return { status: 0, body: 'no_csrf', challengeType: '', link: null };
+
+  try {
+    const r = await fetch(URL_TARGET, {
+      method: 'POST', credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json;charset=utf-8',
+        'x-csrf-token': csrf,
+      },
+      body: BODY,
+    });
+
+    const newCsrf = r.headers.get('x-csrf-token');
+    if (newCsrf) window.__csrf = newCsrf;
+
+    const text = await r.text();
+    const ctype = r.headers.get('rblx-challenge-type') || '';
+
+    // Ищем ссылку прямо здесь в JS
+    let link = null;
+    try {
+      const data = JSON.parse(text);
+      const find = (obj) => {
+        if (!obj || typeof obj !== 'object') return null;
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          if (typeof v === 'string') {
+            if (v.includes('withpersona.com') || v.includes('persona.com')) return v;
+            if (typeof v === 'string' && v.startsWith('inq_') && v.length > 10) {
+              const tok = obj['sessionToken'] || obj['session_token'] || '';
+              let lnk = 'https://inquiry.withpersona.com/verify?inquiry-id=' + v;
+              if (tok) lnk += '&session-token=' + tok;
+              return lnk;
+            }
+          } else if (typeof v === 'object') {
+            const res = find(v);
+            if (res) return res;
+          }
+        }
+        return null;
+      };
+      link = find(data);
+    } catch(e) {
+      // Ищем в сыром тексте
+      const m = text.match(/https:\\/\\/[^\\s"'\\\\]+withpersona\\.com[^\\s"'\\\\]*inquiry-id=[^\\s"'\\\\&]+/);
+      if (m) link = m[0];
+    }
+
+    return { status: r.status, body: text, challengeType: ctype, link: link };
+  } catch(e) {
+    return { status: 0, body: String(e), challengeType: '', link: null };
+  }
+}
+"""
+
+# JS батч — 25 параллельных запросов, каждый проверяет ссылку
 JS_FETCH_BATCH = """
 async (count) => {
   const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
   const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
   if (!window.__csrf) {
-    const r0 = await fetch(URL_TARGET, {
-      method: 'POST', credentials: 'include',
-      headers: { 'Content-Type': 'application/json;charset=utf-8' },
-      body: BODY,
-    });
-    const c = r0.headers.get('x-csrf-token');
-    if (c) window.__csrf = c;
+    try {
+      const r0 = await fetch(URL_TARGET, {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json;charset=utf-8' },
+        body: BODY,
+      });
+      const c = r0.headers.get('x-csrf-token');
+      if (c) window.__csrf = c;
+    } catch(e) {}
   }
 
   const csrf = window.__csrf;
   if (!csrf) return [];
+
+  const findLink = (text) => {
+    try {
+      const data = JSON.parse(text);
+      const find = (obj) => {
+        if (!obj || typeof obj !== 'object') return null;
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          if (typeof v === 'string') {
+            if (v.includes('withpersona.com') || v.includes('persona.com')) return v;
+            if (v.startsWith('inq_') && v.length > 10) {
+              const tok = obj['sessionToken'] || obj['session_token'] || '';
+              let lnk = 'https://inquiry.withpersona.com/verify?inquiry-id=' + v;
+              if (tok) lnk += '&session-token=' + tok;
+              return lnk;
+            }
+          } else if (typeof v === 'object') {
+            const res = find(v);
+            if (res) return res;
+          }
+        }
+        return null;
+      };
+      return find(data);
+    } catch(e) {
+      const m = text.match(/https:\\/\\/[^\\s"'\\\\]+withpersona\\.com[^\\s"'\\\\]*inquiry-id=[^\\s"'\\\\&]+/);
+      return m ? m[0] : null;
+    }
+  };
 
   const tasks = Array.from({ length: count }, () =>
     fetch(URL_TARGET, {
@@ -256,12 +363,15 @@ async (count) => {
     }).then(async r => {
       const newCsrf = r.headers.get('x-csrf-token');
       if (newCsrf) window.__csrf = newCsrf;
+      const text = await r.text();
+      const link = findLink(text);
       return {
         status: r.status,
-        body: await r.text(),
+        body: text,
         challengeType: r.headers.get('rblx-challenge-type') || '',
+        link: link,
       };
-    }).catch(e => ({ status: 0, body: String(e), challengeType: '' }))
+    }).catch(e => ({ status: 0, body: String(e), challengeType: '', link: null }))
   );
 
   return await Promise.all(tasks);
@@ -269,10 +379,30 @@ async (count) => {
 """
 
 BATCH_SIZE     = 25
-PAUSE_NORMAL   = 0.3   # пауза между батчами без 2FA
-PAUSE_2FA_WAIT = 5.0   # ждём подольше — юзер должен одобрить 2FA на телефоне
-PAUSE_429      = 5.0   # rate limit — пауза
+PAUSE_NORMAL   = 0.3
+PAUSE_2FA_WAIT = 5.0
+PAUSE_429      = 5.0
 DEADLINE       = 600   # 10 минут
+MAX_ERRORS     = 5     # сколько подряд ошибок до перезагрузки страницы
+
+
+def _reload_page(page, cookie_value):
+    """Перезагружает страницу и сбрасывает CSRF."""
+    try:
+        logging.info("Перезагружаю страницу...")
+        page.goto("https://www.roblox.com/my/account#!/info",
+                  wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(2000)
+        # Сбрасываем кешированный CSRF чтобы JS получил новый
+        try:
+            page.evaluate("() => { window.__csrf = null; }")
+        except Exception:
+            pass
+        logging.info("Страница перезагружена")
+        return True
+    except Exception as e:
+        logging.error("Ошибка перезагрузки: %s", e)
+        return False
 
 
 def run_2fa_worker(cookie: str, method: str) -> str | None:
@@ -298,17 +428,36 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
             start = time.time()
             iteration = 0
             total_requests = 0
+            consecutive_errors = 0  # счётчик подряд идущих ошибок
 
             while time.time() - start < DEADLINE:
                 if page.is_closed():
+                    logging.warning("Страница закрылась, выходим")
                     break
                 iteration += 1
 
-                results = page.evaluate(JS_FETCH_BATCH, BATCH_SIZE)
+                try:
+                    results = page.evaluate(JS_FETCH_BATCH, BATCH_SIZE)
+                except Exception as e:
+                    consecutive_errors += 1
+                    logging.warning("Ошибка evaluate #%d: %s", consecutive_errors, e)
+                    if consecutive_errors >= MAX_ERRORS:
+                        logging.warning("Много ошибок подряд — перезагружаю страницу")
+                        _reload_page(page, cookie)
+                        consecutive_errors = 0
+                    page.wait_for_timeout(1000)
+                    continue
+
                 if not results:
+                    consecutive_errors += 1
+                    if consecutive_errors >= MAX_ERRORS:
+                        logging.warning("Пустые результаты — перезагружаю страницу")
+                        _reload_page(page, cookie)
+                        consecutive_errors = 0
                     page.wait_for_timeout(500)
                     continue
 
+                consecutive_errors = 0  # сбрасываем счётчик ошибок
                 total_requests += len(results)
                 elapsed = time.time() - start
                 rps = total_requests / elapsed if elapsed > 0 else 0
@@ -320,45 +469,61 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
 
                 got_429 = False
                 got_2fa = False
-                link = None
+                all_zero = True  # все запросы упали с ошибкой сети
 
                 for r in results:
                     status = r.get("status")
                     body   = r.get("body", "")
                     ctype  = r.get("challengeType") or ""
+                    link   = r.get("link")  # JS уже проверил ссылку
+
+                    if status != 0:
+                        all_zero = False
+
+                    if link:
+                        # Ссылка найдена прямо в JS — возвращаем сразу
+                        logging.info("LINK FOUND (JS): %s", link)
+                        browser.close()
+                        return link
 
                     if status == 200:
                         logging.info("status=200 body=%s", body[:500])
+                        # Дополнительная проверка на Python стороне
                         try:
-                            link = extract_link_from_api(json.loads(body))
+                            py_link = extract_link_from_api(json.loads(body))
                         except Exception:
-                            link = None
-                        link = link or extract_link_from_raw(body)
-                        if link:
-                            logging.info("LINK FOUND: %s", link)
+                            py_link = None
+                        py_link = py_link or extract_link_from_raw(body)
+                        if py_link:
+                            logging.info("LINK FOUND (Python): %s", py_link)
                             browser.close()
-                            return link
+                            return py_link
                         else:
-                            logging.warning("status=200 но ссылка не найдена в body=%s", body[:300])
+                            logging.warning("status=200 но ссылка не найдена! body=%s", body[:300])
 
                     elif status == 429:
                         got_429 = True
                         logging.warning("429 rate limit!")
 
                     elif status == 403:
-                        ctype_lower = ctype.lower()
-                        if "twostepverification" in ctype_lower:
+                        if "twostepverification" in ctype.lower():
                             got_2fa = True
                             logging.info("403 + 2FA challenge — ждём подтверждения от юзера...")
                         else:
-                            # Обычный 403 — возможно просто нет CSRF или сессия истекла
-                            logging.warning("403 без 2FA challenge, ctype=%s body=%s", ctype, body[:200])
+                            logging.warning("403 без 2FA, ctype=%s body=%s", ctype, body[:150])
 
                     elif status == 0:
-                        logging.warning("Запрос упал с ошибкой: %s", body[:100])
+                        logging.warning("Запрос упал: %s", body[:80])
+
+                # Если все 25 запросов упали с ошибкой сети — перезагружаем
+                if all_zero:
+                    consecutive_errors += 1
+                    if consecutive_errors >= 2:
+                        logging.warning("Все запросы падают — перезагружаю страницу")
+                        _reload_page(page, cookie)
+                        consecutive_errors = 0
 
                 if got_2fa:
-                    # Юзер должен одобрить 2FA на своём телефоне — даём время
                     page.wait_for_timeout(int(PAUSE_2FA_WAIT * 1000))
                 elif got_429:
                     page.wait_for_timeout(int(PAUSE_429 * 1000))
