@@ -1,865 +1,454 @@
 # -*- coding: utf-8 -*-
 """
-2FA Worker — запускается на отдельных Railway аккаунтах.
-Принимает POST /get-link с cookie и method, возвращает ссылку.
+2FA Worker — Flask-сервис на Railway.
+POST /get-link  { cookie, method, secret }  → { link }
+Получает ссылку Persona за 30–120 секунд, поддерживает аккаунты с 2FA.
 """
 import os
 import re
 import json
-import logging
 import time
+import logging
+import concurrent.futures as _futures
+
+import requests as _requests
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
-logging.basicConfig(level=logging.INFO)
+# ─────────────────────────────── настройки ────────────────────────────────── #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
-app = Flask(__name__)
+WORKER_SECRET   = os.environ.get("WORKER_SECRET", "mysecret")
+DEADLINE        = int(os.environ.get("DEADLINE", 120))   # макс. секунд на попытку
+BATCH_SIZE      = int(os.environ.get("BATCH_SIZE", 25))  # параллельных запросов
+PAUSE_2FA       = float(os.environ.get("PAUSE_2FA", 2.0))# пауза при 403+2FA
+PAUSE_429       = float(os.environ.get("PAUSE_429", 0.5))# пауза при 429
 
-WORKER_SECRET = os.environ.get("WORKER_SECRET", "mysecret")  # защита от чужих запросов
-
-
-# ===== ИЗВЛЕЧЕНИЕ ССЫЛКИ =====
-
-def extract_link_from_api(data):
-    if not isinstance(data, dict):
-        return None
-    for key in ["verificationUrl", "redirectUrl", "url", "link",
-                "personaUrl", "inquiryUrl", "sessionUrl", "verifyUrl",
-                "inquiryLink", "personaLink"]:
-        val = data.get(key, "")
-        if val and isinstance(val, str) and val.startswith("http"):
-            if "withpersona.com" in val or "persona.com" in val:
-                return val
-    inq_id = (data.get("inquiryId") or data.get("inquiry_id")
-              or data.get("sessionIdentifier") or data.get("inqId"))
-    session_token = (data.get("sessionToken") or data.get("session_token")
-                     or data.get("sessionKey"))
-    if inq_id and str(inq_id).startswith("inq_"):
-        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + str(inq_id)
-        if session_token:
-            link += "&session-token=" + str(session_token)
-        return link
-
-    def find_deep(obj):
-        if isinstance(obj, str):
-            if ("withpersona.com" in obj or "persona.com" in obj) and obj.startswith("http"):
-                return obj
-            return None
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, str) and v.startswith("http"):
-                    if "withpersona.com" in v or "persona.com" in v:
-                        return v
-                if isinstance(v, str) and v.startswith("inq_") and len(v) > 10:
-                    tok = obj.get("sessionToken") or obj.get("session_token") or ""
-                    lnk = "https://inquiry.withpersona.com/verify?inquiry-id=" + v
-                    if tok:
-                        lnk += "&session-token=" + tok
-                    return lnk
-            for v in obj.values():
-                r = find_deep(v)
-                if r:
-                    return r
-        elif isinstance(obj, list):
-            for item in obj:
-                r = find_deep(item)
-                if r:
-                    return r
-        return None
-
-    return find_deep(data)
-
-
-def extract_link_from_raw(body: str):
-    if not body:
-        return None
-    m = re.search(r'https://[^\s"\'\\]+withpersona\.com[^\s"\'\\]*inquiry-id=[^\s"\'\\&]+(?:&[^\s"\'\\]*)?', body)
-    if m:
-        return m.group(0).rstrip("\\")
-    m = re.search(r'inquiry-id=(inq_[A-Za-z0-9]+)', body)
-    if m:
-        inq_id = m.group(1)
-        tok_m = re.search(r'session-token=([A-Za-z0-9_\-\.]+)', body)
-        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
-        if tok_m:
-            link += "&session-token=" + tok_m.group(1)
-        return link
-    m = re.search(r'"inq_([A-Za-z0-9]{10,})"', body)
-    if m:
-        inq_id = "inq_" + m.group(1)
-        tok_m = re.search(r'"sessionToken"\s*:\s*"([^"]{20,})"', body)
-        if not tok_m:
-            tok_m = re.search(r'"session[_-]?[Tt]oken"\s*:\s*"([^"]{20,})"', body)
-        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
-        if tok_m:
-            link += "&session-token=" + tok_m.group(1)
-        return link
-    return None
-
-
-# ===== БЫСТРЫЙ API (БЕЗ 2FA) =====
-
-import requests as _requests
-
-def run_fast_api(cookie: str, method: str) -> str | None:
-    """Быстрый метод через прямой API запрос — работает без 2FA, ~2 секунды."""
-    try:
-        url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
-        body = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
-
-        s = _requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-            "Content-Type": "application/json;charset=utf-8",
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account#!/info",
-        })
-
-        # Шаг 1: получаем CSRF
-        r1 = s.post(url, json=body, timeout=15)
-        logging.info("Fast API step1: %d", r1.status_code)
-        if r1.status_code == 200:
-            link = extract_link_from_api(r1.json()) or extract_link_from_raw(r1.text)
-            if link:
-                return link
-
-        csrf = r1.headers.get("x-csrf-token")
-        if not csrf:
-            return None
-
-        # Шаг 2: с CSRF
-        s.headers["x-csrf-token"] = csrf
-        r2 = s.post(url, json=body, timeout=15)
-        logging.info("Fast API step2: %d body=%s", r2.status_code, r2.text[:300])
-        if r2.status_code == 200:
-            return extract_link_from_api(r2.json()) or extract_link_from_raw(r2.text)
-
-        return None
-    except Exception as e:
-        logging.error("Fast API error: %s", e)
-        return None
-
-
-# ===== БЕЗ 2FA ВОРКЕР =====
-
-def run_no2fa_worker(cookie: str, method: str) -> str | None:
-    """Для аккаунтов без 2FA: заходим на страницу, кликаем Continue, делаем API запрос."""
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-setuid-sandbox",
-                    "--single-process",
-                    "--no-zygote",
-                ]
-            )
-            page, ctx = _make_page(browser, cookie)
-            # _make_page уже кликает Continue если есть
-
-            # Делаем один батч запросов через JS (CSRF получается автоматически)
-            JS_SINGLE = """
-async () => {
-  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
-  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
-
-  const send = (csrf) => fetch(URL_TARGET, {
-    method: 'POST', credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json;charset=utf-8',
-      ...(csrf ? { 'x-csrf-token': csrf } : {}),
-    },
-    body: BODY,
-  });
-
-  const findLink = (text) => {
-    try {
-      const data = JSON.parse(text);
-      const walk = (obj, d) => {
-        if (!obj || typeof obj !== 'object' || d > 10) return null;
-        for (const k of Object.keys(obj)) {
-          const v = obj[k];
-          if (typeof v === 'string') {
-            if ((v.includes('withpersona.com') || v.includes('persona.com')) && v.startsWith('http')) return v;
-            if (v.startsWith('inq_') && v.length > 10) {
-              const tok = obj['sessionToken'] || obj['session_token'] || '';
-              return 'https://inquiry.withpersona.com/verify?inquiry-id=' + v + (tok ? '&session-token=' + tok : '');
-            }
-          }
-          if (typeof obj[k] === 'object') { const r = walk(obj[k], d+1); if (r) return r; }
-        }
-        return null;
-      };
-      return walk(data, 0);
-    } catch(e) {
-      const m = text.match(/https:\\/\\/[^\\s"']+withpersona\\.com[^\\s"']*inquiry-id=[^\\s"'&]+/);
-      return m ? m[0] : null;
-    }
-  };
-
-  // 1й запрос — получаем CSRF
-  let r = await send(null);
-  const csrf = r.headers.get('x-csrf-token');
-  console.log('step1:', r.status, 'csrf:', csrf);
-  if (!csrf) {
-    const t = await r.text();
-    return { status: r.status, body: t, link: findLink(t) };
-  }
-
-  // 2й запрос — с CSRF
-  r = await send(csrf);
-  const text = await r.text();
-  console.log('step2:', r.status, text.slice(0, 200));
-  return { status: r.status, body: text, link: findLink(text) };
-}
-"""
-            try:
-                result = page.evaluate(JS_SINGLE)
-                logging.info("no2fa result: status=%s link=%s body=%s",
-                             result.get("status"), result.get("link"), result.get("body", "")[:200])
-                link = result.get("link")
-                if not link and result.get("status") == 200:
-                    link = extract_link_from_api(json.loads(result["body"])) if result.get("body") else None
-                    link = link or extract_link_from_raw(result.get("body", ""))
-            except Exception as e:
-                logging.error("no2fa JS error: %s", e)
-                link = None
-            finally:
-                try: ctx.close()
-                except Exception: pass
-                browser.close()
-
-            return link
-    except Exception as e:
-        logging.error("run_no2fa_worker error: %s", e)
-        return None
-
-
-# ===== 2FA ВОРКЕР =====
-
-# JS который делает один запрос и возвращает статус + body + ссылку если нашлась
-JS_SINGLE_REQUEST = """
-async () => {
-  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
-  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
-
-  // Получаем CSRF если нет
-  if (!window.__csrf) {
-    try {
-      const r0 = await fetch(URL_TARGET, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json;charset=utf-8' },
-        body: BODY,
-      });
-      const c = r0.headers.get('x-csrf-token');
-      if (c) window.__csrf = c;
-    } catch(e) {}
-  }
-
-  const csrf = window.__csrf;
-  if (!csrf) return { status: 0, body: 'no_csrf', challengeType: '', link: null };
-
-  try {
-    const r = await fetch(URL_TARGET, {
-      method: 'POST', credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json;charset=utf-8',
-        'x-csrf-token': csrf,
-      },
-      body: BODY,
-    });
-
-    const newCsrf = r.headers.get('x-csrf-token');
-    if (newCsrf) window.__csrf = newCsrf;
-
-    const text = await r.text();
-    const ctype = r.headers.get('rblx-challenge-type') || '';
-
-    // Ищем ссылку прямо здесь в JS
-    let link = null;
-    try {
-      const data = JSON.parse(text);
-      const find = (obj) => {
-        if (!obj || typeof obj !== 'object') return null;
-        for (const k of Object.keys(obj)) {
-          const v = obj[k];
-          if (typeof v === 'string') {
-            if (v.includes('withpersona.com') || v.includes('persona.com')) return v;
-            if (typeof v === 'string' && v.startsWith('inq_') && v.length > 10) {
-              const tok = obj['sessionToken'] || obj['session_token'] || '';
-              let lnk = 'https://inquiry.withpersona.com/verify?inquiry-id=' + v;
-              if (tok) lnk += '&session-token=' + tok;
-              return lnk;
-            }
-          } else if (typeof v === 'object') {
-            const res = find(v);
-            if (res) return res;
-          }
-        }
-        return null;
-      };
-      link = find(data);
-    } catch(e) {
-      // Ищем в сыром тексте
-      const m = text.match(/https:\\/\\/[^\\s"'\\\\]+withpersona\\.com[^\\s"'\\\\]*inquiry-id=[^\\s"'\\\\&]+/);
-      if (m) link = m[0];
-    }
-
-    return { status: r.status, body: text, challengeType: ctype, link: link };
-  } catch(e) {
-    return { status: 0, body: String(e), challengeType: '', link: null };
-  }
-}
-"""
-
-# JS батч — N параллельных запросов, CSRF получаем один раз глобально
-JS_FETCH_BATCH = """
-async (count) => {
-  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
-  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
-
-  // Глубокий поиск ссылки — обходит весь JSON рекурсивно
-  const findLink = (text) => {
-    let parsed = null;
-    try { parsed = JSON.parse(text); } catch(e) {}
-    if (parsed) {
-      const walk = (obj, depth) => {
-        if (!obj || typeof obj !== 'object' || depth > 10) return null;
-        if (Array.isArray(obj)) {
-          for (const item of obj) { const r = walk(item, depth+1); if (r) return r; }
-          return null;
-        }
-        for (const k of Object.keys(obj)) {
-          const v = obj[k];
-          if (typeof v === 'string') {
-            if ((v.includes('withpersona.com') || v.includes('persona.com')) && v.startsWith('http')) return v;
-            if (v.startsWith('inq_') && v.length > 10) {
-              const tok = obj['sessionToken'] || obj['session_token'] || obj['sessionKey'] || '';
-              let lnk = 'https://inquiry.withpersona.com/verify?inquiry-id=' + v;
-              if (tok) lnk += '&session-token=' + tok;
-              return lnk;
-            }
-          }
-        }
-        for (const k of Object.keys(obj)) {
-          if (typeof obj[k] === 'object') { const r = walk(obj[k], depth+1); if (r) return r; }
-        }
-        return null;
-      };
-      const found = walk(parsed, 0);
-      if (found) return found;
-    }
-    const m1 = text.match(/https:\\/\\/[^\\s"'\\\\]+withpersona\\.com[^\\s"'\\\\]*inquiry-id=[^\\s"'\\\\&]+(?:&[^\\s"'\\\\]*)?/);
-    if (m1) return m1[0].replace(/\\\\+$/, '');
-    const m2 = text.match(/"(inq_[A-Za-z0-9]{10,})"/);
-    if (m2) {
-      const m3 = text.match(/"session[Tt]oken"\\s*:\\s*"([^"]{20,})"/);
-      return 'https://inquiry.withpersona.com/verify?inquiry-id=' + m2[1] + (m3 ? '&session-token=' + m3[1] : '');
-    }
-    return null;
-  };
-
-  // Получаем CSRF один раз глобально (точный паттерн из консоли)
-  if (!window.__csrf) {
-    try {
-      const r0 = await fetch(URL_TARGET, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json;charset=utf-8' },
-        body: BODY,
-      });
-      const c = r0.headers.get('x-csrf-token');
-      console.log('CSRF fetch: status=' + r0.status + ' csrf=' + c);
-      if (c) {
-        window.__csrf = c;
-      } else {
-        // Вдруг 200 без CSRF — проверяем тело
-        const t = await r0.text();
-        console.log('No CSRF, body:', t.slice(0, 200));
-        const lnk = findLink(t);
-        if (lnk) return [{ status: r0.status, body: t, challengeType: '', link: lnk }];
-      }
-    } catch(e) {
-      console.log('CSRF fetch error:', e);
-    }
-  }
-
-  const csrf = window.__csrf;
-  if (!csrf) {
-    console.log('ERROR: no CSRF token available');
-    return [];
-  }
-
-  // Все count задач делают по 1 рабочему запросу с CSRF
-  const oneTask = async () => {
-    try {
-      const r = await fetch(URL_TARGET, {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json;charset=utf-8',
-          'x-csrf-token': csrf,
-        },
-        body: BODY,
-      });
-      // Если вернулся новый CSRF — обновляем
-      const newCsrf = r.headers.get('x-csrf-token');
-      if (newCsrf && newCsrf !== csrf) window.__csrf = newCsrf;
-
-      const text = await r.text();
-      const link = findLink(text);
-      console.log('req:', r.status, link ? 'LINK!' : '');
-      return {
-        status: r.status,
-        body: text,
-        challengeType: r.headers.get('rblx-challenge-type') || '',
-        link,
-      };
-    } catch(e) {
-      return { status: 0, body: String(e), challengeType: '', link: null };
-    }
-  };
-
-  // Все count запросов параллельно — каждый делает 1 рабочий запрос
-  const tasks = Array.from({ length: count }, () => oneTask());
-  return await Promise.all(tasks);
-}
-"""
-
-BATCH_SIZE         = 30    # 30 параллельных → ~200+ req/min
-PAUSE_NORMAL       = 0.0   # без паузы — максимальная скорость
-PAUSE_2FA_WAIT     = 2.0   # ждём подтверждение 2FA
-PAUSE_429          = 0.5   # минимальная пауза при 429
-DEADLINE           = 300   # 5 минут максимум
-MAX_ERRORS         = 3
-ROTATE_PROXY_EVERY = 50    # ротация прокси каждые 50 батчей
-
-MAX_TOTAL_REQUESTS = 150000
-
-
-# ===== ЧИСТЫЙ PYTHON БАТЧ =====
-
-import concurrent.futures as _futures
-
-_URL  = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+_TARGET_URL = (
+    "https://apis.roblox.com/age-verification-service/v1"
+    "/persona-id-verification/start-verification"
+)
 _BODY = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
-_HDRS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Content-Type": "application/json;charset=utf-8",
     "Origin": "https://www.roblox.com",
     "Referer": "https://www.roblox.com/my/account#!/info",
 }
 
-def _get_csrf(cookie: str):
-    try:
-        s = _requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        s.headers.update(_HDRS)
-        r = s.post(_URL, json=_BODY, timeout=8)
-        logging.info("CSRF fetch: status=%d", r.status_code)
-        if r.status_code == 200:
-            link = extract_link_from_api(r.json()) or extract_link_from_raw(r.text)
-            if link:
-                return "__LINK__:" + link
-        return r.headers.get("x-csrf-token")
-    except Exception as e:
-        logging.error("CSRF error: %s", e)
+app = Flask(__name__)
+
+
+# ══════════════════════════ утилиты поиска ссылки ══════════════════════════ #
+
+def _find_link_json(obj, _depth=0):
+    """Рекурсивный поиск Persona-ссылки в JSON-объекте."""
+    if _depth > 12 or not obj:
         return None
+    if isinstance(obj, str):
+        if obj.startswith("http") and ("withpersona.com" in obj or "persona.com" in obj):
+            return obj
+        return None
+    if isinstance(obj, list):
+        for item in obj:
+            r = _find_link_json(item, _depth + 1)
+            if r:
+                return r
+        return None
+    if isinstance(obj, dict):
+        # прямые известные ключи
+        for key in ("verificationUrl", "redirectUrl", "url", "link",
+                    "personaUrl", "inquiryUrl", "sessionUrl", "verifyUrl",
+                    "inquiryLink", "personaLink"):
+            val = obj.get(key, "")
+            if isinstance(val, str) and val.startswith("http") and (
+                    "withpersona.com" in val or "persona.com" in val):
+                return val
+        # строим по inq_id — только короткая ссылка без session-token (не протухает)
+        inq_id = (obj.get("inquiryId") or obj.get("inquiry_id")
+                  or obj.get("inqId") or obj.get("sessionIdentifier"))
+        if isinstance(inq_id, str) and inq_id.startswith("inq_"):
+            return "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
+        # глубже
+        for val in obj.values():
+            r = _find_link_json(val, _depth + 1)
+            if r:
+                return r
+    return None
+
+
+_RE_FULL_LINK   = re.compile(r'https://[^\s"\'\\]+withpersona\.com[^\s"\'\\]*inquiry-id=(inq_[A-Za-z0-9]+)')
+_RE_INQ_ID      = re.compile(r'inquiry-id=(inq_[A-Za-z0-9]+)')
+_RE_INQ_RAW     = re.compile(r'"(inq_[A-Za-z0-9]{10,})"')
+
+
+def extract_link(body: str) -> str | None:
+    """Ищет Persona-ссылку сначала в JSON, потом в сыром тексте."""
+    if not body:
+        return None
+    # попытка JSON
+    try:
+        data = json.loads(body)
+        link = _find_link_json(data)
+        if link:
+            return link
+    except Exception:
+        pass
+    # regex: полная ссылка — берём только inq_id, без session-token
+    m = _RE_FULL_LINK.search(body)
+    if m:
+        return "https://inquiry.withpersona.com/verify?inquiry-id=" + m.group(1)
+    # regex: inquiry-id=inq_...
+    m = _RE_INQ_ID.search(body)
+    if m:
+        return "https://inquiry.withpersona.com/verify?inquiry-id=" + m.group(1)
+    # regex: "inq_..." в JSON
+    m = _RE_INQ_RAW.search(body)
+    if m:
+        return "https://inquiry.withpersona.com/verify?inquiry-id=inq_" + m.group(1)
+    return None
+
+
+# ══════════════════════════════ Python API метод ════════════════════════════ #
+
+def _new_session(cookie: str) -> _requests.Session:
+    s = _requests.Session()
+    s.cookies[".ROBLOSECURITY"] = cookie
+    s.headers.update(_HEADERS)
+    return s
+
+
+def _get_csrf(cookie: str) -> tuple[str | None, str | None]:
+    """Возвращает (csrf_token, link_or_None). link — если с 1-го запроса уже пришла ссылка."""
+    try:
+        s = _new_session(cookie)
+        r = s.post(_TARGET_URL, json=_BODY, timeout=10)
+        if r.status_code == 200:
+            link = extract_link(r.text)
+            if link:
+                return None, link
+        csrf = r.headers.get("x-csrf-token")
+        return csrf, None
+    except Exception as e:
+        logging.warning("_get_csrf error: %s", e)
+        return None, None
+
 
 def _one_request(cookie: str, csrf: str) -> dict:
     try:
-        s = _requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        s.headers.update({**_HDRS, "x-csrf-token": csrf})
-        r = s.post(_URL, json=_BODY, timeout=8)
-        link = None
-        if r.status_code == 200:
-            link = extract_link_from_api(r.json()) or extract_link_from_raw(r.text)
-        return {"status": r.status_code, "link": link,
-                "challengeType": r.headers.get("rblx-challenge-type", ""),
-                "body": r.text[:200]}
+        s = _new_session(cookie)
+        s.headers["x-csrf-token"] = csrf
+        r = s.post(_TARGET_URL, json=_BODY, timeout=10)
+        link = extract_link(r.text) if r.status_code == 200 else None
+        return {
+            "status": r.status_code,
+            "link": link,
+            "challenge": r.headers.get("rblx-challenge-type", ""),
+            "new_csrf": r.headers.get("x-csrf-token"),
+        }
     except Exception as e:
-        return {"status": 0, "link": None, "body": str(e), "challengeType": ""}
+        return {"status": 0, "link": None, "challenge": "", "new_csrf": None, "err": str(e)}
 
 
-def run_parallel_api(cookie: str, workers: int = BATCH_SIZE) -> str | None:
-    start = time.time()
-    total = 0
+def run_api(cookie: str) -> str | None:
+    """
+    Основной метод: параллельные Python-запросы.
+    Работает для аккаунтов БЕЗ 2FA (~2 сек) и С 2FA (бот долбит, пока юзер подтверждает).
+    """
+    deadline = time.time() + DEADLINE
     csrf = None
+    consecutive_429 = 0
 
-    with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        while total < MAX_TOTAL_REQUESTS and time.time() - start < 300:  # 5 минут
+    with _futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
+        while time.time() < deadline:
 
+            # ── получаем CSRF ──────────────────────────────────────────────
             if not csrf:
-                result = _get_csrf(cookie)
-                if not result:
-                    time.sleep(0.5)
+                csrf, early_link = _get_csrf(cookie)
+                if early_link:
+                    logging.info("Early link (no CSRF step): %s", early_link)
+                    return early_link
+                if not csrf:
+                    logging.warning("Нет CSRF — жду 1с")
+                    time.sleep(1)
                     continue
-                if result.startswith("__LINK__:"):
-                    return result[9:]
-                csrf = result
 
-            futs = [ex.submit(_one_request, cookie, csrf) for _ in range(workers)]
-            results = [f.result() for f in _futures.as_completed(futs)]
-            total += len(results)
+            # ── батч параллельных запросов ─────────────────────────────────
+            futs = [pool.submit(_one_request, cookie, csrf) for _ in range(BATCH_SIZE)]
+            results = [f.result() for f in _futures.as_completed(futs, timeout=15)]
 
-            elapsed = time.time() - start
-            logging.info("batch | total=%d | %.1f req/sec | statuses=%s",
-                         total, total / elapsed if elapsed else 0,
-                         [r["status"] for r in results])
+            statuses = [r["status"] for r in results]
+            elapsed  = deadline - time.time()
+            logging.info("batch | statuses=%s | осталось=%.0fс", statuses, elapsed)
+
+            got_2fa  = False
+            got_429  = False
+            need_csrf = False
 
             for r in results:
                 if r.get("link"):
-                    logging.info("LINK FOUND: %s", r["link"])
+                    logging.info("LINK FOUND (api): %s", r['link'])
                     return r["link"]
 
-            if any(r["status"] == 403 for r in results):
-                logging.info("CSRF протух — обновляю")
+                st = r["status"]
+                if st == 200:
+                    # 200 но без ссылки — пробуем ещё
+                    pass
+                elif st == 403:
+                    ch = r.get("challenge", "")
+                    if "twostepverification" in ch.lower():
+                        got_2fa = True
+                    else:
+                        need_csrf = True  # CSRF протух
+                elif st == 429:
+                    got_429 = True
+                    consecutive_429 += 1
+                elif st == 0:
+                    pass  # сетевая ошибка
+
+                # обновляем CSRF если вернулся новый
+                if r.get("new_csrf"):
+                    csrf = r["new_csrf"]
+
+            if need_csrf:
+                logging.info("403 без 2FA — обновляю CSRF")
                 csrf = None
+                continue
 
-            if any("twostepverification" in r.get("challengeType", "").lower() for r in results):
-                logging.info("2FA обнаружена — ждём подтверждения юзера, продолжаем долбить...")
-                time.sleep(PAUSE_2FA_WAIT)
+            if got_2fa:
+                consecutive_429 = 0
+                logging.info("403+2FA — ждём подтверждения юзера, пауза %.1fс", PAUSE_2FA)
+                time.sleep(PAUSE_2FA)
+            elif got_429:
+                logging.warning("429 (подряд %d) — пауза %.1fс", consecutive_429, PAUSE_429 * consecutive_429)
+                time.sleep(PAUSE_429 * min(consecutive_429, 6))
+            else:
+                consecutive_429 = 0
 
+    logging.warning("run_api: дедлайн %dс истёк — ссылка не найдена", DEADLINE)
     return None
 
 
-def _click_continue_if_present(page):
-    """Кликает кнопку Continue ('Use an ID to verify your birthday') если она есть."""
-    try:
-        # Ждём до 4 секунд появления кнопки
-        btn = page.wait_for_selector(
-            "button:has-text('Continue'), "
-            "a:has-text('Continue'), "
-            "[data-testid='continue-button'], "
-            ".birthday-verification-continue button, "
-            "button.btn-cta-md:has-text('Continue')",
-            timeout=4000,
-            state="visible",
-        )
-        if btn:
-            logging.info("Найдена кнопка Continue — кликаю")
-            btn.click()
-            page.wait_for_timeout(1000)
-            logging.info("Continue нажата")
-    except Exception:
-        pass  # Кнопки нет — всё ок, продолжаем
+# ══════════════════════════ Playwright (резервный) ══════════════════════════ #
+# Используется только если run_api ничего не вернул за DEADLINE.
+# Открывает браузер, логинит через cookie, запускает JS-батч.
+
+_JS_BATCH = r"""
+async (count) => {
+  const URL  = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+
+  const findLink = (text) => {
+    let obj = null;
+    try { obj = JSON.parse(text); } catch(e) {}
+    const walk = (o, d) => {
+      if (!o || typeof o !== 'object' || d > 10) return null;
+      for (const k of Object.keys(o)) {
+        const v = o[k];
+        if (typeof v === 'string') {
+          if ((v.includes('withpersona.com') || v.includes('persona.com')) && v.startsWith('http')) return v;
+          if (v.startsWith('inq_') && v.length > 10) {
+            return 'https://inquiry.withpersona.com/verify?inquiry-id=' + v;
+          }
+        }
+      }
+      for (const k of Object.keys(o)) {
+        if (typeof o[k] === 'object') { const r = walk(o[k], d + 1); if (r) return r; }
+      }
+      return null;
+    };
+    if (obj) { const r = walk(obj, 0); if (r) return r; }
+    const m = text.match(/https:\/\/[^\s"'\\]+withpersona\.com[^\s"'\\]*inquiry-id=[^\s"'\\&]+/);
+    return m ? m[0] : null;
+  };
+
+  if (!window.__csrf) {
+    try {
+      const r0 = await fetch(URL, { method:'POST', credentials:'include',
+        headers:{'Content-Type':'application/json;charset=utf-8'}, body: BODY });
+      const c = r0.headers.get('x-csrf-token');
+      if (c) { window.__csrf = c; }
+      else {
+        const t = await r0.text();
+        const lnk = findLink(t);
+        if (lnk) return [{ status: r0.status, link: lnk, challenge: '' }];
+      }
+    } catch(e) {}
+  }
+  if (!window.__csrf) return [];
+
+  const one = async () => {
+    try {
+      const r = await fetch(URL, { method:'POST', credentials:'include',
+        headers:{'Content-Type':'application/json;charset=utf-8','x-csrf-token': window.__csrf}, body: BODY });
+      const nc = r.headers.get('x-csrf-token');
+      if (nc) window.__csrf = nc;
+      const text = await r.text();
+      return { status: r.status, link: findLink(text),
+               challenge: r.headers.get('rblx-challenge-type') || '' };
+    } catch(e) {
+      return { status: 0, link: null, challenge: '' };
+    }
+  };
+  return await Promise.all(Array.from({ length: count }, () => one()));
+}
+"""
+
+
+def _launch_browser():
+    p = sync_playwright().__enter__()
+    browser = p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+              "--disable-setuid-sandbox", "--single-process", "--no-zygote"],
+    )
+    return p, browser
 
 
 def _make_page(browser, cookie: str):
-    """Создаёт новый контекст с новым прокси и возвращает страницу."""
     ctx = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        user_agent=_HEADERS["User-Agent"],
         viewport={"width": 1280, "height": 800},
     )
     ctx.add_cookies([{
-        "name": ".ROBLOSECURITY",
-        "value": cookie,
-        "domain": ".roblox.com",
-        "path": "/",
+        "name": ".ROBLOSECURITY", "value": cookie,
+        "domain": ".roblox.com", "path": "/",
     }])
     page = ctx.new_page()
     page.goto("https://www.roblox.com/my/account#!/info",
-              wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(1500)
-    _click_continue_if_present(page)
+              wait_until="domcontentloaded", timeout=30_000)
+    page.wait_for_timeout(1_500)
+    # кнопка Continue если есть
+    try:
+        btn = page.wait_for_selector(
+            "button:has-text('Continue'), [data-testid='continue-button']",
+            timeout=4_000, state="visible",
+        )
+        if btn:
+            btn.click()
+            page.wait_for_timeout(800)
+    except Exception:
+        pass
     return page, ctx
 
 
-def _safe_reload(page, cookie: str):
-    """Перезагружает страницу и сбрасывает CSRF в JS."""
+def run_playwright(cookie: str) -> str | None:
+    """Резервный метод через браузер — нужен если Python-запросы не могут пройти."""
+    p = pw = ctx = page = None
     try:
-        logging.info("Перезагружаю страницу...")
-        page.evaluate("() => { window.__csrf = null; }")
-        page.goto("https://www.roblox.com/my/account#!/info",
-                  wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(1000)
-        _click_continue_if_present(page)
-        logging.info("Страница перезагружена.")
-    except Exception as e:
-        logging.warning("Ошибка при перезагрузке: %s", e)
+        p, browser = _launch_browser()
+        page, ctx = _make_page(browser, cookie)
 
+        deadline = time.time() + DEADLINE
+        consecutive_errors = 0
 
-def _recover(browser, ctx, cookie: str):
-    """Полная пересоздание контекста при критической ошибке."""
-    try:
-        ctx.close()
-    except Exception:
-        pass
-    try:
-        return _make_page(browser, cookie)
-    except Exception as e:
-        logging.error("Ошибка восстановления контекста: %s", e)
-        raise
-
-
-def run_2fa_worker(cookie: str, method: str) -> str | None:
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-setuid-sandbox",
-                    "--single-process",
-                    "--no-zygote",
-                ]
-            )
-            page, ctx = _make_page(browser, cookie)
-
-            start            = time.time()
-            iteration        = 0
-            total_requests   = 0
-            consecutive_errors = 0
-            consecutive_429  = 0
-            consecutive_net_errors = 0  # ошибки сети (status=0)
-
-            while time.time() - start < DEADLINE:
-                # ── лимит запросов ──────────────────────────────────────────
-                if total_requests >= MAX_TOTAL_REQUESTS:
-                    logging.info("Лимит %d запросов достигнут — стоп.", MAX_TOTAL_REQUESTS)
-                    break
-
-                # ── страница закрылась ──────────────────────────────────────
-                if page.is_closed():
-                    logging.warning("Страница закрылась — пересоздаю контекст")
-                    try:
-                        page, ctx = _recover(browser, ctx, cookie)
-                        consecutive_errors = 0
-                        consecutive_net_errors = 0
-                    except Exception:
-                        time.sleep(1)
-                    continue
-
-                iteration += 1
-
-                # ── плановая ротация прокси ─────────────────────────────────
-                if iteration % ROTATE_PROXY_EVERY == 0:
-                    logging.info("Плановая ротация прокси (batch #%d)", iteration)
-                    try:
-                        page, ctx = _recover(browser, ctx, cookie)
-                        consecutive_429 = 0
-                    except Exception as e:
-                        logging.error("Ошибка ротации прокси: %s", e)
-                    continue
-
-                # ── выполняем батч запросов ─────────────────────────────────
-                try:
-                    results = page.evaluate(JS_FETCH_BATCH, BATCH_SIZE)
-                except Exception as e:
-                    consecutive_errors += 1
-                    logging.warning("Ошибка evaluate #%d: %s", consecutive_errors, e)
-                    if consecutive_errors >= MAX_ERRORS:
-                        logging.warning("Много ошибок evaluate — полное восстановление")
-                        try:
-                            page, ctx = _recover(browser, ctx, cookie)
-                        except Exception:
-                            pass
-                        consecutive_errors = 0
-                        consecutive_net_errors = 0
-                    else:
-                        # Сначала пробуем просто перезагрузить страницу
-                        _safe_reload(page, cookie)
-                    continue
-
-                # ── пустой ответ ────────────────────────────────────────────
-                if not results:
-                    consecutive_errors += 1
-                    logging.warning("Пустой результат батча #%d", consecutive_errors)
-                    if consecutive_errors >= MAX_ERRORS:
-                        logging.warning("Пустые результаты — меняю контекст")
-                        try:
-                            page, ctx = _recover(browser, ctx, cookie)
-                        except Exception:
-                            pass
-                        consecutive_errors = 0
-                    else:
-                        _safe_reload(page, cookie)
-                    continue
-
-                consecutive_errors = 0
-                total_requests += len(results)
-                elapsed = time.time() - start
-                rps     = total_requests / elapsed if elapsed > 0 else 0
-                logging.info(
-                    "batch#%d | total=%d/150000 | %.1f req/sec | statuses=%s",
-                    iteration, total_requests, rps,
-                    [r.get("status") for r in results]
-                )
-
-                got_429  = False
-                got_2fa  = False
-                all_zero = True
-
-                for r in results:
-                    status = r.get("status")
-                    body   = r.get("body", "")
-                    ctype  = r.get("challengeType") or ""
-                    link   = r.get("link")
-
-                    if status != 0:
-                        all_zero = False
-
-                    # ── ссылка найдена ──────────────────────────────────────
-                    if link:
-                        logging.info("LINK FOUND (JS): %s", link)
-                        try:
-                            ctx.close()
-                        except Exception:
-                            pass
-                        browser.close()
-                        return link
-
-                    if status == 200:
-                        logging.info("status=200 body=%s", body[:500])
-                        try:
-                            py_link = extract_link_from_api(json.loads(body))
-                        except Exception:
-                            py_link = None
-                        py_link = py_link or extract_link_from_raw(body)
-                        if py_link:
-                            logging.info("LINK FOUND (Python): %s", py_link)
-                            try:
-                                ctx.close()
-                            except Exception:
-                                pass
-                            browser.close()
-                            return py_link
-                        else:
-                            logging.warning("status=200 но ссылка не найдена! body=%s", body[:300])
-
-                    elif status == 429:
-                        got_429 = True
-                        consecutive_429 += 1
-                        logging.warning("429 rate limit! (подряд: %d)", consecutive_429)
-
-                    elif status == 403:
-                        if "twostepverification" in ctype.lower():
-                            got_2fa = True
-                            logging.info("403 + 2FA — ждём подтверждения...")
-                        else:
-                            logging.warning("403 без 2FA, ctype=%s body=%s", ctype, body[:150])
-
-                    elif status == 0:
-                        logging.warning("Сетевая ошибка запроса: %s", body[:80])
-
-                # ── все запросы упали с сетевой ошибкой ────────────────────
-                if all_zero:
-                    consecutive_net_errors += 1
-                    logging.warning("Все %d запросов упали (сеть). Подряд: %d",
-                                    BATCH_SIZE, consecutive_net_errors)
-                    if consecutive_net_errors >= 2:
-                        logging.warning("Перезагружаю страницу из-за сетевых ошибок")
-                        _safe_reload(page, cookie)
-                        consecutive_net_errors = 0
-                    else:
-                        page.wait_for_timeout(300)
-                else:
-                    consecutive_net_errors = 0
-
-                # ── паузы по типу ответа ────────────────────────────────────
-                if got_2fa:
-                    page.wait_for_timeout(int(PAUSE_2FA_WAIT * 1000))
-
-                elif got_429:
-                    if consecutive_429 >= 2:
-                        logging.warning("429 подряд %d — меняю прокси немедленно!", consecutive_429)
-                        try:
-                            page, ctx = _recover(browser, ctx, cookie)
-                            consecutive_429 = 0
-                        except Exception as e:
-                            logging.error("Ошибка смены прокси: %s", e)
-                    else:
-                        page.wait_for_timeout(int(PAUSE_429 * 1000))
-
-                else:
-                    consecutive_429 = 0
-                    if PAUSE_NORMAL > 0:
-                        page.wait_for_timeout(int(PAUSE_NORMAL * 1000))
-
+        while time.time() < deadline:
             try:
-                ctx.close()
+                results = page.evaluate(_JS_BATCH, BATCH_SIZE)
+            except Exception as e:
+                consecutive_errors += 1
+                logging.warning("JS error #%d: %s", consecutive_errors, e)
+                if consecutive_errors >= 3:
+                    logging.warning("Пересоздаю контекст")
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    page, ctx = _make_page(browser, cookie)
+                    consecutive_errors = 0
+                else:
+                    try:
+                        page.evaluate("() => { window.__csrf = null; }")
+                        page.goto("https://www.roblox.com/my/account#!/info",
+                                  wait_until="domcontentloaded", timeout=20_000)
+                        page.wait_for_timeout(1_000)
+                    except Exception:
+                        pass
+                continue
+
+            if not results:
+                page.wait_for_timeout(500)
+                continue
+
+            consecutive_errors = 0
+            got_2fa = False
+
+            for r in results:
+                if r.get("link"):
+                    logging.info("LINK FOUND (playwright): %s", r['link'])
+                    return r["link"]
+                if r.get("status") == 403 and "twostepverification" in r.get("challenge", "").lower():
+                    got_2fa = True
+
+            if got_2fa:
+                page.wait_for_timeout(int(PAUSE_2FA * 1000))
+            else:
+                page.wait_for_timeout(200)
+
+    except Exception as e:
+        logging.error("run_playwright error: %s", e)
+    finally:
+        for obj in (ctx, ):
+            try:
+                if obj:
+                    obj.close()
             except Exception:
                 pass
-            browser.close()
-
-    except Exception as e:
-        logging.error("Worker error: %s", e)
+        try:
+            if p:
+                p.__exit__(None, None, None)
+        except Exception:
+            pass
 
     return None
 
 
-# ===== FLASK API =====
+# ══════════════════════════════════ Flask API ═══════════════════════════════ #
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "deadline": DEADLINE, "batch": BATCH_SIZE})
 
 
 @app.route("/get-link", methods=["POST"])
 def get_link():
-    """2FA режим — сначала пробуем быстрый API, потом Playwright с батчами."""
-    secret = request.headers.get("X-Secret") or request.json.get("secret", "")
+    # авторизация
+    data   = request.get_json(silent=True) or {}
+    secret = request.headers.get("X-Secret") or data.get("secret", "")
     if secret != WORKER_SECRET:
         return jsonify({"error": "unauthorized"}), 401
 
-    data = request.json or {}
     cookie = data.get("cookie", "").strip()
     method = data.get("method", "camera").strip()
 
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
 
-    logging.info("New task: method=%s cookie=%.20s...", method, cookie)
+    logging.info("Task start | method=%s | cookie=%.20s...", method, cookie)
+    t0 = time.time()
 
-    # 1. Параллельный Python API — новый прокси на каждый запрос, максимальная скорость
-    link = run_parallel_api(cookie, workers=BATCH_SIZE)
+    # ── 1. Python API (быстро, без браузера) ──────────────────────────────
+    link = run_api(cookie)
+
+    # ── 2. Playwright (если API не справился) ─────────────────────────────
+    if not link:
+        logging.info("API не дал ссылку — пробую Playwright")
+        link = run_playwright(cookie)
+
+    elapsed = round(time.time() - t0)
     if link:
-        logging.info("Parallel API succeeded!")
-        return jsonify({"link": link})
-
-    # 2. Без 2FA — браузер, клик Continue (на случай если нужен клик по странице)
-    link = run_no2fa_worker(cookie, method)
-    if link:
-        logging.info("No-2FA worker succeeded!")
-        return jsonify({"link": link})
-
-    # 3. Playwright с батчами — для 2FA аккаунтов
-    link = run_2fa_worker(cookie, method)
-
-    if link:
-        return jsonify({"link": link})
+        logging.info("SUCCESS in %ds: %s", elapsed, link)
+        return jsonify({"link": link, "elapsed": elapsed})
     else:
-        return jsonify({"error": "failed to get link"}), 500
-
-
-@app.route("/get-link-fast", methods=["POST"])
-def get_link_fast():
-    """Быстрый метод без 2FA — только API запрос, ~2 секунды."""
-    secret = request.headers.get("X-Secret") or request.json.get("secret", "")
-    if secret != WORKER_SECRET:
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.json or {}
-    cookie = data.get("cookie", "").strip()
-    method = data.get("method", "camera").strip()
-
-    if not cookie:
-        return jsonify({"error": "cookie required"}), 400
-
-    logging.info("Fast task: method=%s cookie=%.20s...", method, cookie)
-
-    link = run_fast_api(cookie, method)
-
-    if link:
-        return jsonify({"link": link})
-    else:
-        return jsonify({"error": "failed to get link"}), 500
+        logging.error("FAIL after %ds", elapsed)
+        return jsonify({"error": "failed to get link", "elapsed": elapsed}), 500
 
 
 if __name__ == "__main__":
