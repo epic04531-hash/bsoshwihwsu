@@ -118,18 +118,29 @@ def extract_link(body: str) -> str | None:
 
 # ══════════════════════════════ Python API метод ════════════════════════════ #
 
-def _new_session(cookie: str) -> _requests.Session:
+def _build_session(cookie: str) -> _requests.Session:
+    """
+    Один persistent Session с большим connection pool'ом.
+    Критично для скорости: Session() каждый раз = новый TLS handshake (сотни мс),
+    а 25 параллельных потоков на одном пуле без этого фактически сериализуются.
+    """
     s = _requests.Session()
     s.cookies[".ROBLOSECURITY"] = cookie
     s.headers.update(_HEADERS)
+    adapter = _requests.adapters.HTTPAdapter(
+        pool_connections=BATCH_SIZE * 2,
+        pool_maxsize=BATCH_SIZE * 2,
+        max_retries=0,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 
-def _get_csrf(cookie: str) -> tuple[str | None, str | None]:
+def _get_csrf(session: _requests.Session) -> tuple[str | None, str | None]:
     """Возвращает (csrf_token, link_or_None). link — если с 1-го запроса уже пришла ссылка."""
     try:
-        s = _new_session(cookie)
-        r = s.post(_TARGET_URL, json=_BODY, timeout=10)
+        r = session.post(_TARGET_URL, json=_BODY, timeout=6)
         if r.status_code == 200:
             link = extract_link(r.text)
             if link:
@@ -141,12 +152,26 @@ def _get_csrf(cookie: str) -> tuple[str | None, str | None]:
         return None, None
 
 
-def _one_request(cookie: str, csrf: str) -> dict:
+def _one_request(session: _requests.Session, csrf: str, req_no: int = 0) -> dict:
     try:
-        s = _new_session(cookie)
-        s.headers["x-csrf-token"] = csrf
-        r = s.post(_TARGET_URL, json=_BODY, timeout=10)
+        r = session.post(_TARGET_URL, json=_BODY, timeout=6,
+                          headers={"x-csrf-token": csrf})
         link = extract_link(r.text) if r.status_code == 200 else None
+
+        # ── лог КАЖДОЙ попытки, чтобы видеть, не теряется ли ссылка ────────
+        if link:
+            logging.info("  req#%d → 200 LINK: %s", req_no, link)
+        elif r.status_code == 200:
+            # статус 200, но ссылка не распозналась — показываем сырой body
+            logging.warning("  req#%d → 200 NO-LINK, body=%s", req_no, r.text[:300])
+        elif r.status_code == 403:
+            ch = r.headers.get("rblx-challenge-type", "")
+            logging.info("  req#%d → 403 challenge=%s", req_no, ch)
+        elif r.status_code == 429:
+            logging.info("  req#%d → 429 rate-limit", req_no)
+        else:
+            logging.info("  req#%d → %d body=%s", req_no, r.status_code, r.text[:150])
+
         return {
             "status": r.status_code,
             "link": link,
@@ -154,6 +179,7 @@ def _one_request(cookie: str, csrf: str) -> dict:
             "new_csrf": r.headers.get("x-csrf-token"),
         }
     except Exception as e:
+        logging.warning("  req#%d → ERROR %s", req_no, e)
         return {"status": 0, "link": None, "challenge": "", "new_csrf": None, "err": str(e)}
 
 
@@ -165,13 +191,14 @@ def run_api(cookie: str) -> str | None:
     deadline = time.time() + DEADLINE
     csrf = None
     consecutive_429 = 0
+    session = _build_session(cookie)
 
     with _futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
         while time.time() < deadline:
 
             # ── получаем CSRF ──────────────────────────────────────────────
             if not csrf:
-                csrf, early_link = _get_csrf(cookie)
+                csrf, early_link = _get_csrf(session)
                 if early_link:
                     logging.info("Early link (no CSRF step): %s", early_link)
                     return early_link
@@ -180,13 +207,21 @@ def run_api(cookie: str) -> str | None:
                     time.sleep(1)
                     continue
 
-            # ── батч параллельных запросов ─────────────────────────────────
-            futs = [pool.submit(_one_request, cookie, csrf) for _ in range(BATCH_SIZE)]
-            results = [f.result() for f in _futures.as_completed(futs, timeout=15)]
+            # ── батч параллельных запросов (один общий Session+pool) ────────
+            batch_no = getattr(run_api, "_batch_no", 0) + 1
+            run_api._batch_no = batch_no
+            base = batch_no * BATCH_SIZE
+            futs = [pool.submit(_one_request, session, csrf, base + i)
+                    for i in range(BATCH_SIZE)]
+            results = [f.result() for f in _futures.as_completed(futs, timeout=8)]
 
             statuses = [r["status"] for r in results]
+            found_links = [r["link"] for r in results if r.get("link")]
             elapsed  = deadline - time.time()
-            logging.info("batch | statuses=%s | осталось=%.0fс", statuses, elapsed)
+            logging.info(
+                "batch#%d | statuses=%s | links_found=%d | осталось=%.0fс",
+                batch_no, statuses, len(found_links), elapsed,
+            )
 
             got_2fa  = False
             got_429  = False
@@ -380,10 +415,14 @@ def run_playwright(cookie: str) -> str | None:
             consecutive_errors = 0
             got_2fa = False
 
-            for r in results:
+            logging.info("pw batch | statuses=%s", [r.get("status") for r in results])
+
+            for i, r in enumerate(results):
                 if r.get("link"):
-                    logging.info("LINK FOUND (playwright): %s", r['link'])
+                    logging.info("  pw req#%d → LINK: %s", i, r['link'])
                     return r["link"]
+                if r.get("status") == 200:
+                    logging.warning("  pw req#%d → 200 NO-LINK", i)
                 if r.get("status") == 403 and "twostepverification" in r.get("challenge", "").lower():
                     got_2fa = True
 
@@ -431,7 +470,8 @@ def get_link():
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
 
-    logging.info("Task start | method=%s | cookie=%.20s...", method, cookie)
+    logging.info("=" * 60)
+    logging.info("TASK START | method=%s | cookie_len=%d", method, len(cookie))
     t0 = time.time()
 
     # ── 1. Python API (быстро, без браузера) ──────────────────────────────
@@ -439,15 +479,17 @@ def get_link():
 
     # ── 2. Playwright (если API не справился) ─────────────────────────────
     if not link:
-        logging.info("API не дал ссылку — пробую Playwright")
+        logging.info("API не дал ссылку за %ds — пробую Playwright", DEADLINE)
         link = run_playwright(cookie)
 
     elapsed = round(time.time() - t0)
     if link:
-        logging.info("SUCCESS in %ds: %s", elapsed, link)
+        logging.info("TASK SUCCESS in %ds | FINAL LINK: %s", elapsed, link)
+        logging.info("=" * 60)
         return jsonify({"link": link, "elapsed": elapsed})
     else:
-        logging.error("FAIL after %ds", elapsed)
+        logging.error("TASK FAIL after %ds | ни один запрос не дал ссылку", elapsed)
+        logging.info("=" * 60)
         return jsonify({"error": "failed to get link", "elapsed": elapsed}), 500
 
 
