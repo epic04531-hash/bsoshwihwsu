@@ -1,3 +1,4 @@
-flask
-requests
-playwright
+python-telegram-bot==20.7
+requests[socks]
+psycopg2-binary
+PySocks
