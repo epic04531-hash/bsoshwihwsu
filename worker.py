@@ -17,6 +17,12 @@ from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+try:
+    import socks  # noqa: F401
+except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests[socks]", "-q"])
+
 app = Flask(__name__)
 
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "mysecret")
@@ -56,6 +62,8 @@ def _next_proxy() -> str | None:
 def _proxy_dict(proxy_str: str | None) -> dict | None:
     if not proxy_str:
         return None
+    if proxy_str.startswith("socks5://") or proxy_str.startswith("socks4://"):
+        return {"http": proxy_str, "https": proxy_str}
     if not proxy_str.startswith("http"):
         proxy_str = "http://" + proxy_str
     return {"http": proxy_str, "https": proxy_str}
