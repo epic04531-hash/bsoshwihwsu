@@ -1,4 +1,4 @@
-flask
-requests[socks]
-psycopg2-binary
-python-telegram-bot[job-queue]
+flask>=3.0.0
+requests[socks]>=2.31.0
+psycopg2-binary>=2.9.9
+python-telegram-bot[job-queue]>=21.0
