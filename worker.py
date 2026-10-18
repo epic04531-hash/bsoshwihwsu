@@ -276,12 +276,20 @@ def run_parallel_api_for_duration(
     workers: int = BATCH_SIZE,
     target_emails: int = EMAIL_BURST_TARGET,
     duration_sec: float = DEADLINE,
-) -> str | None:
+) -> "str | dict | None":
+    """
+    Возвращает:
+      str  — готовая ссылка withpersona.com
+      dict — {"challengeId": ..., "csrf": ..., "emailSent": True} — код отправлен, нужен ввод
+      None — неудача / таймаут
+    """
     start = time.time()
     last_wave_reset = start
     total = 0
     challenges_in_wave = 0
     emails_sent_total = 0
+    last_challenge_id: str | None = None
+    last_csrf: str | None = None
 
     user_id, csrf = _get_user_id_and_csrf(cookie)
     if csrf and csrf.startswith("__LINK__:"):
@@ -335,6 +343,11 @@ def run_parallel_api_for_duration(
                     found_link = r["link"]
                 if r.get("status") == 403 and r.get("challengeType"):
                     challenges_in_wave += 1
+                    # Сохраняем последний challenge для fallback-ответа боту
+                    if r.get("challengeId"):
+                        last_challenge_id = r["challengeId"]
+                    if r.get("newCsrf"):
+                        last_csrf = r["newCsrf"]
                 if r.get("emailSent"):
                     emails_sent_total += 1
 
@@ -381,6 +394,19 @@ def run_parallel_api_for_duration(
     if found_link:
         return found_link
 
+    # Если email был отправлен — возвращаем challenge данные боту чтобы он мог
+    # запросить код у пользователя и завершить верификацию
+    if emails_sent_total > 0 and last_challenge_id and last_csrf:
+        logging.info(
+            "Email отправлен, ссылка не получена за %ds — возвращаем challenge боту. cid=%s",
+            int(duration_sec), last_challenge_id,
+        )
+        return {
+            "challengeId": last_challenge_id,
+            "csrf": last_csrf,
+            "emailSent": True,
+        }
+
     logging.error("Время вышло: %ds, всего запросов: %d, email отправлено: %d", int(duration_sec), total, emails_sent_total)
     return None
 
@@ -407,7 +433,7 @@ def get_link():
         return jsonify({"error": "worker busy, try another worker"}), 503
 
     try:
-        link = run_parallel_api_for_duration(
+        result = run_parallel_api_for_duration(
             cookie,
             workers=BATCH_SIZE,
             target_emails=EMAIL_BURST_TARGET,
@@ -416,8 +442,16 @@ def get_link():
     finally:
         _request_sem.release()
 
-    if link:
-        return jsonify({"link": link})
+    if isinstance(result, str):
+        # Готовая ссылка
+        return jsonify({"link": result})
+    if isinstance(result, dict) and result.get("challengeId"):
+        # Email-код отправлен — передаём challenge боту для ввода кода пользователем
+        return jsonify({
+            "challengeId": result["challengeId"],
+            "csrf": result["csrf"],
+            "emailSent": result.get("emailSent", False),
+        })
     return jsonify({"error": "failed to get link within deadline"}), 500
 
 if __name__ == "__main__":
