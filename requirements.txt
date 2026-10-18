@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+flask
 requests[socks]
 psycopg2-binary
-PySocks
+python-telegram-bot[job-queue]
