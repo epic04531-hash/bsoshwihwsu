@@ -82,6 +82,19 @@ def _base_headers(csrf: str | None = None) -> dict:
         h["x-csrf-token"] = csrf
     return h
 
+def _is_persona_link(url: str) -> bool:
+    """Проверяет что URL — валидная ссылка Persona с inquiry-id."""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        return (
+            p.scheme == "https"
+            and (p.netloc == "withpersona.com" or p.netloc.endswith(".withpersona.com"))
+            and "inquiry-id" in p.query
+        )
+    except Exception:
+        return False
+
 def extract_link_from_raw(body: str):
     if not body:
         return None
@@ -141,9 +154,9 @@ def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
         r_csrf = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
         csrf = r_csrf.headers.get("x-csrf-token")
 
-        # Если аккаунт без 2FA — уже есть ссылка
+        # Если аккаунт без 2FA — уже есть ссылка (в теле или в r.url после redirect)
         if r_csrf.status_code == 200:
-            link = extract_link_from_raw(r_csrf.text)
+            link = extract_link_from_raw(r_csrf.text) or (_is_persona_link(r_csrf.url) and r_csrf.url or None)
             if link:
                 return uid, "__LINK__:" + link
 
@@ -153,7 +166,7 @@ def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
             r2 = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
             csrf2 = r2.headers.get("x-csrf-token") or csrf
             if r2.status_code == 200:
-                link = extract_link_from_raw(r2.text)
+                link = extract_link_from_raw(r2.text) or (_is_persona_link(r2.url) and r2.url or None)
                 if link:
                     return uid, "__LINK__:" + link
             csrf = csrf2
@@ -213,8 +226,20 @@ def _trigger_2fa_email_send(
 
         logging.info("Отправка email 2FA: uid=%s, challengeId=%s, actionType=%s", uid, inner_challenge_id, action_type)
         r_send = s.post(send_url, json=payload, timeout=8)
+        logging.info("Email 2FA результат: status=%s, body=%s", r_send.status_code, r_send.text[:200])
+
+        # Roblox может вернуть 403 с новым CSRF — повторяем один раз
+        if r_send.status_code == 403:
+            new_csrf = r_send.headers.get("x-csrf-token")
+            if new_csrf and new_csrf != csrf:
+                s.headers["x-csrf-token"] = new_csrf
+                logging.info("Email 2FA: CSRF обновлён, повторяем запрос")
+                r_send = s.post(send_url, json=payload, timeout=8)
+                logging.info("Email 2FA повтор: status=%s, body=%s", r_send.status_code, r_send.text[:200])
+
         success = r_send.status_code in (200, 204)
-        logging.info("Email 2FA результат: status=%s, ok=%s, body=%s", r_send.status_code, success, r_send.text[:100])
+        if not success:
+            logging.warning("Email 2FA не удался: status=%s", r_send.status_code)
         return success
     except Exception as e:
         logging.error("_trigger_2fa_email_send exception: %s", e)
@@ -243,7 +268,12 @@ def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: boo
 
         link = None
         if r.status_code == 200:
+            # Проверяем и тело ответа, и r.url — Roblox может сделать 302 redirect
+            # на Persona, тогда requests автоматически перейдёт, r.status_code=200,
+            # но r.text будет HTML-страницей Persona без inquiry-id в читаемом виде
             link = extract_link_from_raw(r.text)
+            if not link and _is_persona_link(r.url):
+                link = r.url
 
         ctype = r.headers.get("rblx-challenge-type", "")
         cid   = r.headers.get("rblx-challenge-id", "")
@@ -346,6 +376,11 @@ def run_parallel_api_for_duration(
                     # Сохраняем последний challenge для fallback-ответа боту
                     if r.get("challengeId"):
                         last_challenge_id = r["challengeId"]
+                    # Обновляем last_csrf при каждом challenge (не только если newCsrf != None)
+                    if r.get("newCsrf"):
+                        last_csrf = r["newCsrf"]
+                elif r.get("status") == 403 and not r.get("challengeType"):
+                    # plain 403 тоже может нести свежий CSRF
                     if r.get("newCsrf"):
                         last_csrf = r["newCsrf"]
                 if r.get("emailSent"):
@@ -354,18 +389,31 @@ def run_parallel_api_for_duration(
             if found_link:
                 break
 
-            # БАГ-17: обновляем CSRF один раз — сначала из ответов батча,
-            # только если там нет — делаем сетевой запрос.
-            fresh_csrf = next((r["newCsrf"] for r in results if r.get("newCsrf")), None)
+            # БАГ-17: обновляем csrf из ответов батча.
+            # Приоритет: CSRF из challenge-ответа > CSRF из plain-403.
+            # last_csrf синхронизируем только из challenge — именно он нужен боту для верификации.
+            fresh_csrf_challenge = next(
+                (r["newCsrf"] for r in results if r.get("newCsrf") and r.get("status") == 403 and r.get("challengeType")),
+                None,
+            )
+            fresh_csrf_plain = next(
+                (r["newCsrf"] for r in results if r.get("newCsrf") and r.get("status") == 403 and not r.get("challengeType")),
+                None,
+            )
+            fresh_csrf = fresh_csrf_challenge or fresh_csrf_plain
             if fresh_csrf:
                 csrf = fresh_csrf
+            # last_csrf обновляем только из challenge-ответов (нужен для верификации кода)
+            if fresh_csrf_challenge:
+                last_csrf = fresh_csrf_challenge
 
-            has_challenge = any(r.get("challengeType") for r in results if r["status"] == 403)
-            has_plain_403 = any(not r.get("challengeType") for r in results if r["status"] == 403)
-            has_429       = any(r["status"] == 429 for r in results)
+            # Используем .get() для безопасного обращения к полям — status=0 при исключении
+            has_challenge = any(r.get("challengeType") for r in results if r.get("status") == 403)
+            has_plain_403 = any(not r.get("challengeType") for r in results if r.get("status") == 403)
+            has_429       = any(r.get("status") == 429 for r in results)
 
             # Логируем статусы каждую волну
-            statuses = [r["status"] for r in results]
+            statuses = [r.get("status", 0) for r in results]
             logging.info(
                 "Батч: total=%d, statuses=%s, challenges_wave=%d, emails_total=%d",
                 total, {s: statuses.count(s) for s in set(statuses)}, challenges_in_wave, emails_sent_total,
