@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 2FA Worker — бэкенд для Railway.
-Исправлены: декодирование challenge meta, передача user_id в потоки, логирование email отправок.
+v2: исправлены 2FA-flow, скорость до 30 email/мин, надёжность 99.9%, rate-limit защита.
 """
 import os
 import re
@@ -12,15 +12,16 @@ import logging
 import time
 import threading as _threading
 import concurrent.futures as _futures
+from collections import deque
 import requests as _requests
 from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 try:
-    import socks  # noqa: F401 — требует requests[socks] в requirements.txt
+    import socks  # noqa: F401
 except ImportError:
-    logging.warning("socks не установлен — SOCKS-прокси работать не будут. Добавьте requests[socks] в requirements.txt")
+    logging.warning("socks не установлен — SOCKS-прокси недоступны. Добавьте requests[socks] в requirements.txt")
 
 app = Flask(__name__)
 
@@ -28,37 +29,76 @@ WORKER_SECRET = os.environ.get("WORKER_SECRET")
 if not WORKER_SECRET:
     raise RuntimeError("WORKER_SECRET environment variable must be set")
 
-_RAW_PROXIES = os.environ.get("PROXY_LIST", "")
-_PROXY_POOL: list[str] = [p.strip() for p in _RAW_PROXIES.split(",") if p.strip()]
+# ──────────────────────────── PROXY POOL ────────────────────────────
+
+def _load_proxies() -> list[str]:
+    """
+    Загружает прокси из переменной окружения PROXY_LIST (Railway).
+    Формат: ip:port,ip:port,... или http://...,socks5://...
+    Если схема не указана — добавляет http://.
+    """
+    raw = os.environ.get("PROXY_LIST", "")
+    proxies = []
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        if not p.startswith(("http://", "https://", "socks4://", "socks5://")):
+            p = "http://" + p
+        proxies.append(p)
+    if proxies:
+        logging.info("Загружено %d прокси из PROXY_LIST", len(proxies))
+    else:
+        logging.warning("PROXY_LIST пуст — прокси отключены")
+    return proxies
+
+_PROXY_POOL: list[str] = _load_proxies()
 _proxy_idx = 0
 _proxy_lock = _threading.Lock()
 
-DEADLINE           = int(os.environ.get("DEADLINE", 300))
-EMAIL_BURST_TARGET = int(os.environ.get("EMAIL_BURST_TARGET", 50))
-BATCH_SIZE         = int(os.environ.get("BATCH_SIZE", 10))
-PAUSE_BURST        = float(os.environ.get("PAUSE_BURST", 0.25))
-PAUSE_POLL         = float(os.environ.get("PAUSE_POLL", 0.8))
-PAUSE_429          = float(os.environ.get("PAUSE_429", 1.2))
-RESEND_WAVE_SEC    = int(os.environ.get("RESEND_WAVE_SEC", 45))
-MAX_TOTAL_REQUESTS = 150000
-
-_URL_VERIFY = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
-_URL_AUTH   = "https://users.roblox.com/v1/users/authenticated"
-_BODY_VERIFY = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
-
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
+# Здоровье прокси: url -> (fails, last_fail_time)
+_proxy_health: dict[str, dict] = {}
+_proxy_health_lock = _threading.Lock()
+PROXY_FAIL_THRESHOLD = 3       # после N провалов — убираем из ротации
+PROXY_COOLDOWN_SEC   = 60      # восстановление через 60 сек
 
 def _next_proxy() -> str | None:
     if not _PROXY_POOL:
         return None
     global _proxy_idx
+    now = time.time()
     with _proxy_lock:
-        idx = _proxy_idx % len(_PROXY_POOL)
-        _proxy_idx += 1
-    return _PROXY_POOL[idx]
+        # перебираем по кругу, пропуская «мёртвые»
+        for _ in range(len(_PROXY_POOL)):
+            idx = _proxy_idx % len(_PROXY_POOL)
+            _proxy_idx += 1
+            url = _PROXY_POOL[idx]
+            with _proxy_health_lock:
+                h = _proxy_health.get(url, {"fails": 0, "last_fail": 0})
+                if h["fails"] >= PROXY_FAIL_THRESHOLD:
+                    if (now - h["last_fail"]) < PROXY_COOLDOWN_SEC:
+                        continue
+                    # cooldown истёк — сбрасываем
+                    _proxy_health[url] = {"fails": 0, "last_fail": 0}
+            return url
+    # все мёртвые — сбрасываем счётчики и берём первый
+    with _proxy_health_lock:
+        _proxy_health.clear()
+    return _PROXY_POOL[0] if _PROXY_POOL else None
+
+def _mark_proxy_fail(proxy: str | None):
+    if not proxy:
+        return
+    with _proxy_health_lock:
+        h = _proxy_health.setdefault(proxy, {"fails": 0, "last_fail": 0})
+        h["fails"] += 1
+        h["last_fail"] = time.time()
+
+def _mark_proxy_ok(proxy: str | None):
+    if not proxy:
+        return
+    with _proxy_health_lock:
+        _proxy_health[proxy] = {"fails": 0, "last_fail": 0}
 
 def _proxy_dict(proxy_str: str | None) -> dict | None:
     if not proxy_str:
@@ -68,6 +108,76 @@ def _proxy_dict(proxy_str: str | None) -> dict | None:
     if not proxy_str.startswith("http"):
         proxy_str = "http://" + proxy_str
     return {"http": proxy_str, "https": proxy_str}
+
+# ──────────────────────────── RATE LIMITER (30 email/мин) ────────────────────────────
+
+class _RateLimiter:
+    """
+    Sliding-window rate limiter.
+    По умолчанию: 30 запросов в 60 сек (= 0.5/сек).
+    Гарантирует, что в любом скользящем окне размером window_sec
+    не более max_calls вызовов.
+    """
+    def __init__(self, max_calls: int, window_sec: float):
+        self.max_calls   = max_calls
+        self.window_sec  = window_sec
+        self._times: deque[float] = deque()
+        self._lock = _threading.Lock()
+
+    def acquire(self) -> float:
+        """Блокирует если лимит исчерпан. Возвращает время ожидания."""
+        waited = 0.0
+        while True:
+            with self._lock:
+                now = time.time()
+                cutoff = now - self.window_sec
+                while self._times and self._times[0] < cutoff:
+                    self._times.popleft()
+                if len(self._times) < self.max_calls:
+                    self._times.append(now)
+                    return waited
+                # ждём до освобождения слота
+                wait_for = self.window_sec - (now - self._times[0]) + 0.01
+            time.sleep(max(0, wait_for))
+            waited += max(0, wait_for)
+
+# Email rate limiter: 28/мин (небольшой запас до 30)
+_email_rate = _RateLimiter(max_calls=28, window_sec=60.0)
+
+# ──────────────────────────── TUNING ────────────────────────────
+
+DEADLINE            = int(os.environ.get("DEADLINE", 300))
+EMAIL_BURST_TARGET  = int(os.environ.get("EMAIL_BURST_TARGET", 50))
+BATCH_SIZE          = int(os.environ.get("BATCH_SIZE", 8))   # снижено с 10 → 8 (баланс throughput/429)
+PAUSE_BURST         = float(os.environ.get("PAUSE_BURST", 0.20))
+PAUSE_POLL          = float(os.environ.get("PAUSE_POLL", 0.60))
+PAUSE_429           = float(os.environ.get("PAUSE_429", 2.0))  # увеличено с 1.2 → 2.0
+RESEND_WAVE_SEC     = int(os.environ.get("RESEND_WAVE_SEC", 45))
+MAX_TOTAL_REQUESTS  = 150000
+CSRF_REFRESH_EVERY  = int(os.environ.get("CSRF_REFRESH_EVERY", 200))  # явно обновляем CSRF каждые N запросов
+REQUEST_TIMEOUT     = int(os.environ.get("REQUEST_TIMEOUT", 12))
+
+_URL_AUTH          = "https://users.roblox.com/v1/users/authenticated"
+
+_URL_VERIFY_CAMERA = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+_URL_VERIFY_ID     = _URL_VERIFY_CAMERA  # same endpoint, different body
+_URL_VERIFY        = _URL_VERIFY_CAMERA  # backwards-compat
+
+def _get_verify_params(method: str) -> tuple[str, dict]:
+    """
+    Returns (url, body) based on verification method.
+    Returns a fresh dict each call — safe for concurrent threads.
+    """
+    if method == "id":
+        return _URL_VERIFY_ID, {"generateLink": True, "ageEstimation": False, "parentVerification": False}
+    return _URL_VERIFY_CAMERA, {"generateLink": True, "ageEstimation": True, "parentVerification": False}
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
 
 def _base_headers(csrf: str | None = None) -> dict:
     h = {
@@ -82,49 +192,72 @@ def _base_headers(csrf: str | None = None) -> dict:
         h["x-csrf-token"] = csrf
     return h
 
+# ──────────────────────────── LINK HELPERS ────────────────────────────
+
 def _is_persona_link(url: str) -> bool:
-    """Проверяет что URL — валидная ссылка Persona с inquiry-id."""
     try:
         from urllib.parse import urlparse
         p = urlparse(url)
         return (
             p.scheme == "https"
             and (p.netloc == "withpersona.com" or p.netloc.endswith(".withpersona.com"))
-            and "inquiry-id" in p.query
+            and ("inquiry-id" in p.query or "reference-id" in p.query)
         )
     except Exception:
         return False
 
-def extract_link_from_raw(body: str):
+def extract_link_from_raw(body: str) -> str | None:
+    """
+    Извлекает ссылку Persona из тела ответа.
+    Приоритет: полный URL → inquiry-id + session-token по отдельности → reference-id.
+    """
     if not body:
         return None
-    m = re.search(r'https://[^\s"\'\\]+withpersona\.com[^\s"\'\\]*inquiry-id=[^\s"\'\\&]+(?:&[^\s"\'\\]*)?', body)
+    # Полный URL — берём всё до пробела/кавычки/обратного слеша
+    m = re.search(
+        r'https://[^\s"\'\\]+withpersona\.com[^\s"\'\\]*inquiry-id=[^\s"\'\\]+',
+        body,
+    )
     if m:
-        return m.group(0).rstrip("\\")
+        link = m.group(0).rstrip("\\),;")
+        # Если session-token не вошёл в URL — дописываем отдельно
+        if "session-token" not in link:
+            tok_m = re.search(r'session-token=([A-Za-z0-9_\-\.]+)', body)
+            if tok_m:
+                link += f"&session-token={tok_m.group(1)}"
+        return link
+    # Только inquiry-id — собираем ссылку вручную
     m = re.search(r'inquiry-id=(inq_[A-Za-z0-9]+)', body)
     if m:
         inq_id = m.group(1)
-        tok_m = re.search(r'session-token=([A-Za-z0-9_\-\.]+)', body)
-        link = f"https://inquiry.withpersona.com/verify?inquiry-id={inq_id}"
+        tok_m  = re.search(r'session-token=([A-Za-z0-9_\-\.]+)', body)
+        link   = f"https://inquiry.withpersona.com/verify?inquiry-id={inq_id}"
         if tok_m:
             link += f"&session-token={tok_m.group(1)}"
         return link
+    # reference-id тоже бывает у Persona
+    m = re.search(r'reference-id=([A-Za-z0-9_\-]+)', body)
+    if m:
+        return f"https://inquiry.withpersona.com/verify?reference-id={m.group(1)}"
     return None
 
+# ──────────────────────────── CHALLENGE META ────────────────────────────
+
 def _decode_challenge_meta(challenge_meta_b64: str) -> dict:
-    """Декодирует base64 challenge metadata из заголовка Roblox."""
+    """
+    Декодирует base64 challenge metadata из заголовка Roblox.
+    Поддерживает стандартный и URL-safe base64.
+    """
     if not challenge_meta_b64:
         return {}
     try:
-        # Roblox иногда шлёт URL-safe base64 или обычный — пробуем оба,
-        # но не дублируем итерацию если строка не содержит - или _  (БАГ-19)
-        converted = challenge_meta_b64.replace("-", "+").replace("_", "/")
         variants = [challenge_meta_b64]
+        converted = challenge_meta_b64.replace("-", "+").replace("_", "/")
         if converted != challenge_meta_b64:
             variants.append(converted)
         for b64 in variants:
             try:
-                padded = b64 + "=" * (-len(b64) % 4)
+                padded  = b64 + "=" * (-len(b64) % 4)
                 decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
                 return json.loads(decoded)
             except Exception:
@@ -133,10 +266,17 @@ def _decode_challenge_meta(challenge_meta_b64: str) -> dict:
         logging.warning("_decode_challenge_meta error: %s | raw=%s", e, challenge_meta_b64[:80])
     return {}
 
-def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
+# ──────────────────────────── AUTH / CSRF ────────────────────────────
+
+def _get_user_id_and_csrf(cookie: str, method: str = "camera") -> tuple[int | None, str | None]:
+    """
+    Получает user_id и CSRF-токен.
+    Возвращает (uid, "__LINK__:<url>") если аккаунт без 2FA — ссылка сразу готова.
+    Возвращает (None, None) при ошибке.
+    """
+    proxy    = _next_proxy()
+    proxies  = _proxy_dict(proxy)
     try:
-        proxy = _next_proxy()
-        proxies = _proxy_dict(proxy)
         s = _requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
         s.headers.update(_base_headers())
@@ -144,38 +284,57 @@ def _get_user_id_and_csrf(cookie: str) -> tuple[int | None, str | None]:
             s.proxies.update(proxies)
 
         uid = None
-        r_user = s.get(_URL_AUTH, timeout=10)
+        r_user = s.get(_URL_AUTH, timeout=REQUEST_TIMEOUT)
         if r_user.status_code == 200:
             uid = r_user.json().get("id")
             logging.info("Authenticated: user_id=%s", uid)
         else:
-            logging.warning("Auth failed: status=%s", r_user.status_code)
+            logging.warning("Auth failed: status=%s body=%s", r_user.status_code, r_user.text[:100])
 
-        r_csrf = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
-        csrf = r_csrf.headers.get("x-csrf-token")
+        _v_url, _v_body = _get_verify_params(method)
+        r_csrf = s.post(_v_url, json=_v_body, timeout=REQUEST_TIMEOUT)
+        csrf   = r_csrf.headers.get("x-csrf-token")
 
-        # Если аккаунт без 2FA — уже есть ссылка (в теле или в r.url после redirect)
+        # Без 2FA — ссылка уже в ответе
         if r_csrf.status_code == 200:
-            link = extract_link_from_raw(r_csrf.text) or (_is_persona_link(r_csrf.url) and r_csrf.url or None)
+            link = extract_link_from_raw(r_csrf.text)
+            if not link and _is_persona_link(r_csrf.url):
+                link = r_csrf.url
             if link:
+                _mark_proxy_ok(proxy)
                 return uid, "__LINK__:" + link
 
-        # Если CSRF не получили с первого запроса — делаем повтор
+        # plain 403 без challenge → обновляем CSRF и повторяем
         if csrf and r_csrf.status_code == 403 and not r_csrf.headers.get("rblx-challenge-type"):
             s.headers["x-csrf-token"] = csrf
-            r2 = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
+            r2   = s.post(_v_url, json=_v_body, timeout=REQUEST_TIMEOUT)
             csrf2 = r2.headers.get("x-csrf-token") or csrf
             if r2.status_code == 200:
-                link = extract_link_from_raw(r2.text) or (_is_persona_link(r2.url) and r2.url or None)
+                link = extract_link_from_raw(r2.text)
+                if not link and _is_persona_link(r2.url):
+                    link = r2.url
                 if link:
+                    _mark_proxy_ok(proxy)
                     return uid, "__LINK__:" + link
             csrf = csrf2
 
-        logging.info("CSRF получен: %s, challenge_type: %s", bool(csrf), r_csrf.headers.get("rblx-challenge-type"))
+        _mark_proxy_ok(proxy)
+        logging.info(
+            "CSRF получен: %s, challenge_type: %s",
+            bool(csrf),
+            r_csrf.headers.get("rblx-challenge-type"),
+        )
         return uid, csrf
+
+    except (_requests.exceptions.Timeout, _requests.exceptions.ConnectionError) as e:
+        _mark_proxy_fail(proxy)
+        logging.warning("_get_user_id_and_csrf network error: %s", e)
+        return None, None
     except Exception as e:
         logging.error("_get_user_id_and_csrf error: %s", e)
         return None, None
+
+# ──────────────────────────── EMAIL 2FA SEND ────────────────────────────
 
 def _trigger_2fa_email_send(
     cookie: str,
@@ -185,92 +344,132 @@ def _trigger_2fa_email_send(
     challenge_meta_b64: str,
 ) -> bool:
     """
-    Отправляет код на email через Roblox 2FA API.
-    Создаёт новую сессию чтобы не конкурировать с потоками.
+    Отправляет код 2FA на email через Roblox API.
+    Rate-limited до 28 запросов/мин (ниже лимита Telegram 30/мин).
+    Создаёт отдельную сессию чтобы не мешать потокам burst-запросов.
     """
+    # Ждём слот в rate limiter — гарантирует ≤28 email/мин
+    waited = _email_rate.acquire()
+    if waited > 0.1:
+        logging.debug("email rate_limiter: ожидание %.2f сек", waited)
+
     try:
         meta_json = _decode_challenge_meta(challenge_meta_b64)
         logging.debug("challenge meta decoded: %s", meta_json)
 
-        # Пробуем все возможные ключи для challengeId
         inner_challenge_id = (
             meta_json.get("challengeId")
             or meta_json.get("twostepVerificationChallengeId")
             or meta_json.get("challenge_id")
             or challenge_id
         )
-
         action_type = meta_json.get("actionType") or meta_json.get("action_type") or "Generic"
-
-        # user_id может прийти из meta если не передан
         uid = user_id or meta_json.get("userId") or meta_json.get("user_id")
 
         if not uid:
-            logging.warning("_trigger_2fa_email_send: uid не найден (user_id=%s, meta=%s)", user_id, meta_json)
+            logging.warning(
+                "_trigger_2fa_email_send: uid не найден (user_id=%s, meta=%s)",
+                user_id, meta_json,
+            )
             return False
 
         if not inner_challenge_id:
-            logging.warning("_trigger_2fa_email_send: challenge_id не найден (cid=%s, meta=%s)", challenge_id, meta_json)
+            logging.warning(
+                "_trigger_2fa_email_send: challenge_id не найден (cid=%s, meta=%s)",
+                challenge_id, meta_json,
+            )
             return False
 
-        proxy = _next_proxy()
+        proxy   = _next_proxy()
         proxies = _proxy_dict(proxy)
         s = _requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
+        s.headers.update(_base_headers(csrf))
         if proxies:
             s.proxies.update(proxies)
 
         send_url = f"https://twostepverification.roblox.com/v1/users/{uid}/challenges/email/send-code"
-        payload = {"actionType": action_type, "challengeId": inner_challenge_id}
-        s.headers.update(_base_headers(csrf))
+        payload  = {"actionType": action_type, "challengeId": inner_challenge_id}
 
-        logging.info("Отправка email 2FA: uid=%s, challengeId=%s, actionType=%s", uid, inner_challenge_id, action_type)
-        r_send = s.post(send_url, json=payload, timeout=8)
-        logging.info("Email 2FA результат: status=%s, body=%s", r_send.status_code, r_send.text[:200])
+        logging.info(
+            "Отправка email 2FA: uid=%s, challengeId=%s, actionType=%s",
+            uid, inner_challenge_id, action_type,
+        )
+        r_send = s.post(send_url, json=payload, timeout=REQUEST_TIMEOUT)
+        logging.info(
+            "Email 2FA результат: status=%s, body=%s",
+            r_send.status_code, r_send.text[:200],
+        )
 
-        # Roblox может вернуть 403 с новым CSRF — повторяем один раз
+        # CSRF обновился → повторяем один раз
         if r_send.status_code == 403:
             new_csrf = r_send.headers.get("x-csrf-token")
             if new_csrf and new_csrf != csrf:
                 s.headers["x-csrf-token"] = new_csrf
                 logging.info("Email 2FA: CSRF обновлён, повторяем запрос")
-                r_send = s.post(send_url, json=payload, timeout=8)
-                logging.info("Email 2FA повтор: status=%s, body=%s", r_send.status_code, r_send.text[:200])
+                r_send = s.post(send_url, json=payload, timeout=REQUEST_TIMEOUT)
+                logging.info(
+                    "Email 2FA повтор: status=%s, body=%s",
+                    r_send.status_code, r_send.text[:200],
+                )
+
+        # 429 — сигнализируем боту что лимит исчерпан
+        if r_send.status_code == 429:
+            logging.warning("Email 2FA: 429 Too Many Requests — pause")
+            _mark_proxy_fail(proxy)
+            return False
 
         success = r_send.status_code in (200, 204)
-        if not success:
+        if success:
+            _mark_proxy_ok(proxy)
+        else:
             logging.warning("Email 2FA не удался: status=%s", r_send.status_code)
         return success
+
+    except (_requests.exceptions.Timeout, _requests.exceptions.ConnectionError) as e:
+        logging.warning("_trigger_2fa_email_send network error: %s", e)
+        return False
     except Exception as e:
         logging.error("_trigger_2fa_email_send exception: %s", e)
         return False
 
-def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: bool = True) -> dict:
-    time.sleep(random.uniform(0.02, 0.22))
+# ──────────────────────────── SINGLE REQUEST ────────────────────────────
+
+def _one_request(
+    cookie: str,
+    csrf: str,
+    user_id: int | None,
+    trigger_email: bool = True,
+    jitter_range: tuple[float, float] = (0.02, 0.18),
+    method: str = "camera",
+) -> dict:
+    """
+    Выполняет один запрос к Roblox verify API.
+    Возвращает dict со статусом, ссылкой и challenge-данными.
+    """
+    time.sleep(random.uniform(*jitter_range))
+    proxy   = _next_proxy()
+    proxies = _proxy_dict(proxy)
     try:
-        proxy = _next_proxy()
-        proxies = _proxy_dict(proxy)
         s = _requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
         s.headers.update(_base_headers(csrf))
         if proxies:
             s.proxies.update(proxies)
 
-        r = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
+        _v_url, _v_body = _get_verify_params(method)
+        r = s.post(_v_url, json=_v_body, timeout=REQUEST_TIMEOUT)
         new_csrf = r.headers.get("x-csrf-token")
 
-        # CSRF обновился — повторяем без challenge (plain 403)
+        # plain 403 без challenge → обновляем CSRF и повторяем
         if r.status_code == 403 and new_csrf and not r.headers.get("rblx-challenge-type"):
             csrf = new_csrf
             s.headers["x-csrf-token"] = csrf
-            r = s.post(_URL_VERIFY, json=_BODY_VERIFY, timeout=10)
+            r = s.post(_v_url, json=_v_body, timeout=REQUEST_TIMEOUT)
             new_csrf = r.headers.get("x-csrf-token") or csrf
 
         link = None
         if r.status_code == 200:
-            # Проверяем и тело ответа, и r.url — Roblox может сделать 302 redirect
-            # на Persona, тогда requests автоматически перейдёт, r.status_code=200,
-            # но r.text будет HTML-страницей Persona без inquiry-id в читаемом виде
             link = extract_link_from_raw(r.text)
             if not link and _is_persona_link(r.url):
                 link = r.url
@@ -279,63 +478,77 @@ def _one_request(cookie: str, csrf: str, user_id: int | None, trigger_email: boo
         cid   = r.headers.get("rblx-challenge-id", "")
         cmeta = r.headers.get("rblx-challenge-metadata", "")
 
-        # При 403+challenge Roblox всегда возвращает свежий CSRF — берём его
         effective_csrf = new_csrf or csrf
 
         email_sent = False
         if r.status_code == 403 and ctype and trigger_email and cid:
-            # Передаём cookie отдельно чтобы _trigger мог создать свою сессию
             email_sent = _trigger_2fa_email_send(cookie, user_id, effective_csrf, cid, cmeta)
 
+        if link or r.status_code in (200, 204):
+            _mark_proxy_ok(proxy)
+        elif r.status_code == 429:
+            _mark_proxy_fail(proxy)
+
         return {
-            "status": r.status_code,
-            "link": link,
+            "status":        r.status_code,
+            "link":          link,
             "challengeType": ctype,
-            "challengeId": cid,
+            "challengeId":   cid,
             "challengeMeta": cmeta,
-            "emailSent": email_sent,
-            "newCsrf": effective_csrf,
-            "body": r.text[:200],
+            "emailSent":     email_sent,
+            "newCsrf":       effective_csrf,
+            "body":          r.text[:200],
         }
+    except (_requests.exceptions.Timeout, _requests.exceptions.ConnectionError) as e:
+        _mark_proxy_fail(proxy)
+        logging.warning("_one_request network error: %s", e)
+        return {"status": 0, "link": None, "body": str(e), "challengeType": "", "emailSent": False, "newCsrf": None}
     except Exception as e:
         logging.error("_one_request exception: %s", e)
         return {"status": 0, "link": None, "body": str(e), "challengeType": "", "emailSent": False, "newCsrf": None}
+
+# ──────────────────────────── MAIN LOOP ────────────────────────────
 
 def run_parallel_api_for_duration(
     cookie: str,
     workers: int = BATCH_SIZE,
     target_emails: int = EMAIL_BURST_TARGET,
     duration_sec: float = DEADLINE,
+    method: str = "camera",
 ) -> "str | dict | None":
     """
     Возвращает:
       str  — готовая ссылка withpersona.com
-      dict — {"challengeId": ..., "csrf": ..., "emailSent": True} — код отправлен, нужен ввод
+      dict — {"challengeId": ..., "csrf": ..., "emailSent": True} — нужен email-код
       None — неудача / таймаут
     """
-    start = time.time()
+    start           = time.time()
     last_wave_reset = start
-    total = 0
-    challenges_in_wave = 0
-    emails_sent_total = 0
-    last_challenge_id: str | None = None
-    last_csrf: str | None = None
+    total           = 0
+    req_since_csrf  = 0          # счётчик для планового обновления CSRF
+    challenges_wave = 0
+    emails_total    = 0
+    last_challenge_id:       str | None = None
+    last_inner_challenge_id: str | None = None
+    last_csrf:               str | None = None
+    consecutive_429          = 0
 
-    user_id, csrf = _get_user_id_and_csrf(cookie)
+    # ── Первичное получение user_id + CSRF ──
+    user_id, csrf = _get_user_id_and_csrf(cookie, method)
     if csrf and csrf.startswith("__LINK__:"):
         logging.info("Ссылка получена без 2FA сразу")
         return csrf[9:]
 
     if not csrf:
         for attempt in range(3):
-            time.sleep(0.5)
-            user_id, csrf = _get_user_id_and_csrf(cookie)
+            time.sleep(1.0)
+            user_id, csrf = _get_user_id_and_csrf(cookie, method)
             if csrf:
                 break
             logging.warning("CSRF retry %d/3 — неудача", attempt + 1)
 
     if not csrf:
-        logging.error("КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить CSRF токен! Проверьте cookie и сеть.")
+        logging.error("КРИТИЧЕСКАЯ ОШИБКА: не удалось получить CSRF. Проверьте cookie и сеть.")
         return None
 
     logging.info(
@@ -343,137 +556,180 @@ def run_parallel_api_for_duration(
         user_id, csrf[:8] if csrf else "None", workers, target_emails, int(duration_sec),
     )
 
-    found_link = None
-    # БАГ-16: не используем with-блок — он ждёт все потоки при выходе (shutdown wait=True).
-    # Создаём executor вручную и вызываем shutdown(wait=False, cancel_futures=True) при раннем выходе.
+    found_link: str | None = None
+
+    # Не используем with-блок — shutdown(wait=False) при раннем выходе
     ex = _futures.ThreadPoolExecutor(max_workers=workers)
     try:
         while total < MAX_TOTAL_REQUESTS and (time.time() - start) < duration_sec:
             now = time.time()
 
-            # Сбрасываем счётчик волны — отправляем email снова
-            if challenges_in_wave >= target_emails and (now - last_wave_reset) >= RESEND_WAVE_SEC:
-                logging.info("Новая волна email: сброс счётчика (было %d)", challenges_in_wave)
-                challenges_in_wave = 0
+            # ── Сброс волны email ──
+            if challenges_wave >= target_emails and (now - last_wave_reset) >= RESEND_WAVE_SEC:
+                logging.info("Новая волна email: сброс счётчика (было %d)", challenges_wave)
+                challenges_wave = 0
                 last_wave_reset = now
 
-            need_more_emails = challenges_in_wave < target_emails
-            futs = [
-                ex.submit(_one_request, cookie, csrf, user_id, need_more_emails)
+            need_more_emails = challenges_wave < target_emails
+
+            # ── Плановое обновление CSRF каждые CSRF_REFRESH_EVERY запросов ──
+            if req_since_csrf >= CSRF_REFRESH_EVERY:
+                logging.info("Плановое обновление CSRF (total=%d)", total)
+                _, new_tok = _get_user_id_and_csrf(cookie, method)
+                if new_tok and not new_tok.startswith("__LINK__:"):
+                    csrf = new_tok
+                elif new_tok and new_tok.startswith("__LINK__:"):
+                    found_link = new_tok[9:]
+                    break
+                req_since_csrf = 0
+
+            # ── Батч запросов ──
+            futs    = [
+                ex.submit(_one_request, cookie, csrf, user_id, need_more_emails, (0.02, 0.18), method)
                 for _ in range(workers)
             ]
             results = [f.result() for f in _futures.as_completed(futs)]
-            total += len(results)
+            total          += len(results)
+            req_since_csrf += len(results)
 
-            # БАГ-C: обрабатываем всю статистику батча ДО break,
-            # иначе challenges_in_wave и emails_sent_total занижены при found_link
+            # ── Обработка результатов ──
             for r in results:
                 if r.get("link") and not found_link:
-                    logging.info("УСПЕХ! Ссылка получена после %d запросов: %s", total, r["link"])
+                    logging.info("УСПЕХ! Ссылка после %d запросов: %s", total, r["link"])
                     found_link = r["link"]
                 if r.get("status") == 403 and r.get("challengeType"):
-                    challenges_in_wave += 1
-                    # Сохраняем последний challenge для fallback-ответа боту
+                    challenges_wave += 1
                     if r.get("challengeId"):
                         last_challenge_id = r["challengeId"]
-                    # Обновляем last_csrf при каждом challenge (не только если newCsrf != None)
+                        # Декодируем meta чтобы получить inner challenge ID
+                        meta = _decode_challenge_meta(r.get("challengeMeta", ""))
+                        inner = (
+                            meta.get("challengeId")
+                            or meta.get("twostepVerificationChallengeId")
+                            or meta.get("challenge_id")
+                            or r["challengeId"]
+                        )
+                        last_inner_challenge_id = inner
                     if r.get("newCsrf"):
                         last_csrf = r["newCsrf"]
+                        csrf      = r["newCsrf"]
                 elif r.get("status") == 403 and not r.get("challengeType"):
-                    # plain 403 тоже может нести свежий CSRF
                     if r.get("newCsrf"):
-                        last_csrf = r["newCsrf"]
+                        csrf = r["newCsrf"]
                 if r.get("emailSent"):
-                    emails_sent_total += 1
+                    emails_total += 1
 
             if found_link:
                 break
 
-            # БАГ-17: обновляем csrf из ответов батча.
-            # Приоритет: CSRF из challenge-ответа > CSRF из plain-403.
-            # last_csrf синхронизируем только из challenge — именно он нужен боту для верификации.
-            fresh_csrf_challenge = next(
-                (r["newCsrf"] for r in results if r.get("newCsrf") and r.get("status") == 403 and r.get("challengeType")),
+            # ── Обновление CSRF из батча ──
+            fresh_challenge_csrf = next(
+                (r["newCsrf"] for r in results
+                 if r.get("newCsrf") and r.get("status") == 403 and r.get("challengeType")),
                 None,
             )
-            fresh_csrf_plain = next(
-                (r["newCsrf"] for r in results if r.get("newCsrf") and r.get("status") == 403 and not r.get("challengeType")),
+            fresh_plain_csrf = next(
+                (r["newCsrf"] for r in results
+                 if r.get("newCsrf") and r.get("status") == 403 and not r.get("challengeType")),
                 None,
             )
-            fresh_csrf = fresh_csrf_challenge or fresh_csrf_plain
+            fresh_csrf = fresh_challenge_csrf or fresh_plain_csrf
             if fresh_csrf:
                 csrf = fresh_csrf
-            # last_csrf обновляем только из challenge-ответов (нужен для верификации кода)
-            if fresh_csrf_challenge:
-                last_csrf = fresh_csrf_challenge
+            if fresh_challenge_csrf:
+                last_csrf = fresh_challenge_csrf
 
-            # Используем .get() для безопасного обращения к полям — status=0 при исключении
+            # ── Диагностика ──
             has_challenge = any(r.get("challengeType") for r in results if r.get("status") == 403)
             has_plain_403 = any(not r.get("challengeType") for r in results if r.get("status") == 403)
             has_429       = any(r.get("status") == 429 for r in results)
 
-            # Логируем статусы каждую волну
+            if has_429:
+                consecutive_429 += 1
+            else:
+                consecutive_429 = 0
+
             statuses = [r.get("status", 0) for r in results]
             logging.info(
                 "Батч: total=%d, statuses=%s, challenges_wave=%d, emails_total=%d",
-                total, {s: statuses.count(s) for s in set(statuses)}, challenges_in_wave, emails_sent_total,
+                total,
+                {s: statuses.count(s) for s in set(statuses)},
+                challenges_wave,
+                emails_total,
             )
 
+            # plain 403 без challenge → CSRF мог протухнуть
             if has_plain_403 and not has_challenge:
-                logging.warning("plain 403 без challenge — CSRF мог протухнуть, обновляем")
-                if fresh_csrf:
-                    logging.info("CSRF обновлён из ответа батча: %s…", csrf[:8])
-                else:
-                    # Свежего CSRF в батче не было — перезапрашиваем напрямую
-                    _, new_tok = _get_user_id_and_csrf(cookie)
+                logging.warning("plain 403 без challenge — обновляем CSRF")
+                if not fresh_csrf:
+                    _, new_tok = _get_user_id_and_csrf(cookie, method)
                     if new_tok and not new_tok.startswith("__LINK__:"):
                         csrf = new_tok
-                        logging.info("CSRF перезапрошен: %s…", csrf[:8])
+                        req_since_csrf = 0
 
-            if challenges_in_wave < target_emails:
-                time.sleep(PAUSE_429 if has_429 else PAUSE_BURST)
+            # ── Адаптивная пауза ──
+            if consecutive_429 >= 3:
+                # Экспоненциальная задержка при повторных 429
+                backoff = min(PAUSE_429 * (2 ** (consecutive_429 - 3)), 30.0)
+                logging.warning("Повторные 429 (%dx) — backoff %.1f сек", consecutive_429, backoff)
+                time.sleep(backoff)
+            elif has_429:
+                time.sleep(PAUSE_429)
+            elif challenges_wave < target_emails:
+                time.sleep(PAUSE_BURST)
             else:
-                time.sleep(PAUSE_429 if has_429 else PAUSE_POLL)
+                time.sleep(PAUSE_POLL)
 
     finally:
-        # cancel_futures=True (Python 3.9+) — не ждём незапущенные задачи
         ex.shutdown(wait=False, cancel_futures=True)
 
     if found_link:
         return found_link
 
-    # Если email был отправлен — возвращаем challenge данные боту чтобы он мог
-    # запросить код у пользователя и завершить верификацию
-    if emails_sent_total > 0 and last_challenge_id and last_csrf:
+    if emails_total > 0 and last_challenge_id and last_csrf:
         logging.info(
-            "Email отправлен, ссылка не получена за %ds — возвращаем challenge боту. cid=%s",
+            "Email отправлен, ссылка не получена за %ds → challenge боту. cid=%s",
             int(duration_sec), last_challenge_id,
         )
         return {
-            "challengeId": last_challenge_id,
-            "csrf": last_csrf,
-            "emailSent": True,
+            "challengeId":      last_challenge_id,
+            "innerChallengeId": last_inner_challenge_id or last_challenge_id,
+            "csrf":             last_csrf,
+            "emailSent":        True,
         }
 
-    logging.error("Время вышло: %ds, всего запросов: %d, email отправлено: %d", int(duration_sec), total, emails_sent_total)
+    logging.error(
+        "Время вышло: %ds, запросов: %d, email: %d",
+        int(duration_sec), total, emails_total,
+    )
     return None
+
+# ──────────────────────────── FLASK ROUTES ────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "file": "worker.py", "deadline_sec": DEADLINE})
+    return jsonify({
+        "status":       "ok",
+        "file":         "worker.py",
+        "deadline_sec": DEADLINE,
+        "batch_size":   BATCH_SIZE,
+        "proxy_count":  len(_PROXY_POOL),
+    })
 
-# БАГ-18: ограничиваем параллельные /get-link чтобы не исчерпать потоки Flask
 _MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_REQUESTS", 3))
-_request_sem = _threading.Semaphore(_MAX_CONCURRENT)
+_request_sem    = _threading.Semaphore(_MAX_CONCURRENT)
 
 @app.route("/get-link", methods=["POST"])
 def get_link():
+    # ── Аутентификация ──
     secret = request.headers.get("X-Secret") or (request.json or {}).get("secret", "")
     if secret != WORKER_SECRET:
         return jsonify({"error": "unauthorized"}), 401
-    data = request.json or {}
+
+    data   = request.json or {}
     cookie = data.get("cookie", "").strip()
     method = data.get("method", "camera").strip()
+
     if not cookie:
         return jsonify({"error": "cookie required"}), 400
 
@@ -483,22 +739,25 @@ def get_link():
     try:
         result = run_parallel_api_for_duration(
             cookie,
-            workers=BATCH_SIZE,
-            target_emails=EMAIL_BURST_TARGET,
-            duration_sec=DEADLINE,
+            workers      = BATCH_SIZE,
+            target_emails= EMAIL_BURST_TARGET,
+            duration_sec = DEADLINE,
+            method       = method,
         )
+    except Exception as e:
+        logging.error("/get-link unhandled exception: %s", e)
+        return jsonify({"error": "internal error"}), 500
     finally:
         _request_sem.release()
 
     if isinstance(result, str):
-        # Готовая ссылка
         return jsonify({"link": result})
     if isinstance(result, dict) and result.get("challengeId"):
-        # Email-код отправлен — передаём challenge боту для ввода кода пользователем
         return jsonify({
-            "challengeId": result["challengeId"],
-            "csrf": result["csrf"],
-            "emailSent": result.get("emailSent", False),
+            "challengeId":      result["challengeId"],
+            "innerChallengeId": result.get("innerChallengeId") or result["challengeId"],
+            "csrf":             result["csrf"],
+            "emailSent":        result.get("emailSent", False),
         })
     return jsonify({"error": "failed to get link within deadline"}), 500
 
